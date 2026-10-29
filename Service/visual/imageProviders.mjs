@@ -1,4 +1,7 @@
+import {stockProviderAdapters} from './stockProviders.mjs';
+import {raceProviderAdapters} from './imageRaceProviders.mjs';
 import {generateImage,imageGenerationSettings} from './imageGenerationService.mjs';
+import {createHash} from 'node:crypto';
 import { fetchPublicResource } from '../input/publicUrl.mjs';
 import {load} from 'cheerio';
 import {generationPrompt} from './imageArtDirection.mjs';
@@ -9,10 +12,13 @@ import {measureStage} from '../performance.mjs';
 import {evaluateImageRelevance,relevanceDiagnostic} from './imageRelevance.mjs';
 import {bundledPhotoSearch} from './bundledPhotoSearch.mjs';
 import {isPhotographicStock} from './imageMedia.mjs';
+import {geographicAnchors} from './sceneEvidence.mjs';
 
 const plain=value=>load(String(value||'')).text().replace(/\s+/g,' ').trim().slice(0,1600);
 export function stockSearchQueries(query,{slideTitle,subject}={}){
     if(String(query).startsWith('File:'))return [String(query)];
+    const places=geographicAnchors(query);
+    if(places.length){const place=places.join(' ');return [...new Set([query,`${place} skyline`,`${place} waterfront cityscape`,`${place} lagoon city view`])];}
     const compact=String(query||'').replace(/\b(?:breathtaking|stunning|beautiful|high[- ]quality|professional|premium|luxury|cinematic|editorial|photograph(?:ic|y|s)?|photos?|images?|full[- ](?:screen|bleed)|wide[- ]angle|composition|travel[- ]magazine|tasteful|elegant)\b/gi,' ').replace(/[^\p{L}\p{N}\s-]/gu,' ').replace(/\s+/g,' ').trim();
     // Commons search ANDs the words. Scene directions (lighting, framing,
     // mood, etc.) are not usually present in a photograph's metadata.
@@ -87,12 +93,16 @@ export async function commonsCandidates(query,{signal,limit=6}={}){
     });
 }
 export async function commonsSearch(request,{find=commonsCandidates,download=fetchPublicResource}={}){
-    let lastError;const attemptedUrls=new Set();
-    for(const query of stockSearchQueries(request.searchQuery,request).slice(0,request.maxSearchQueries||8)){
+    let lastError;const attemptedUrls=new Set(),queries=stockSearchQueries(request.searchQuery,request),focused=queries.find(query=>query.includes(' OR '));
+    const shortlist=focused?[focused,focused.split(' (')[0]]:queries;
+    let searchRounds=0;
+    for(const query of shortlist.slice(0,Math.min(2,request.maxSearchQueries||1))){
+        searchRounds++;
         let candidates;
         try{const anchor=query.includes(' (')?query.split(' (')[0]:query;candidates=(await find(query,{signal:request.signal})).map(a=>({...a,relevanceScore:candidateSuitability(anchor,a),sceneScore:candidateSuitability(request.searchQuery,a,{partial:true})})).filter(a=>{const eligible=a.relevanceScore>=0&&a.sceneScore>=0;if(!eligible)relevanceDiagnostic(a,request,{accepted:false,reason:'SEARCH_CONTEXT_MISMATCH',method:'independent-metadata'});return eligible;}).sort((a,b)=>b.sceneScore-a.sceneScore||b.relevanceScore-a.relevanceScore);}
         catch(error){if(request.signal?.aborted||error.code==='PHOTO_PROVIDER_RATE_LIMITED')throw error;lastError=error;continue;}
         candidates=candidates.filter(candidate=>{const review=evaluateImageRelevance(candidate,request);relevanceDiagnostic(candidate,request,review);return review.accepted&&(!request.acceptCandidate||request.acceptCandidate(candidate));});
+        imageDiagnostic({generationType:request.generationType||'shared',provider:'commons',status:'candidates-ranked',requirementId:request.requirementId,searchRounds,candidateCount:candidates.length});
         const offset=(request.attempt||0)%Math.max(1,candidates.length);
         for(const candidate of [...candidates.slice(offset),...candidates.slice(0,offset)].filter(c=>!attemptedUrls.has(c.downloadUrl)).slice(0,3)){
             attemptedUrls.add(candidate.downloadUrl);
@@ -107,27 +117,15 @@ export async function commonsSearch(request,{find=commonsCandidates,download=fet
 }
 
 export function configuredImageProviders(env = process.env,{clientFactory,imageGenerator=generateImage}={}) {
-    const policy=imagePolicy(env),settings=imageGenerationSettings(env),model=settings.model;
-    const providers={identity:`${policy.stockProvider}:${policy.generationProvider}:${model||'no-image-model'}:dedicated-image-v2:bundled-v1`,
+    const policy=imagePolicy(env),settings=imageGenerationSettings(env),model=settings.model,stockAdapters=stockProviderAdapters(env);
+    const scope=createHash('sha256').update(JSON.stringify([env.AI_IMAGE_API_KEY||'',env.PEXELS_API_KEY||'',env.OPENVERSE_ENABLED||'',env.AI_STOCK_SEMANTIC_REVIEW||'',env.AI_IMAGE_SEMANTIC_REVIEW==='true',env.CLAUDE_MODEL||'claude-opus-5-5'])).digest('hex');
+    const providers={identity:`${policy.stockProvider}:${policy.generationProvider}:${model||'no-image-model'}:${scope}:dedicated-image-v2:stock-scene-v3:bundled-v1`,
         validateSearchAsset:(request,asset)=>evaluateImageRelevance(asset,request).accepted&&(!asset.source?.startsWith('Wikimedia Commons')||candidateSuitability(request.searchQuery,asset,{partial:asset.source==='Wikimedia Commons'})>=0),
-        ...(env.PEXELS_API_KEY&&['auto','pexels'].includes(policy.stockProvider) ? { search: async request => {
-            const url = new URL('https://api.pexels.com/v1/search');
-            url.search = new URLSearchParams({ query: request.searchQuery, per_page: '4', orientation: 'landscape', size: 'large' });
-            const response = await fetch(url, { headers: { Authorization: env.PEXELS_API_KEY }, signal: request.signal||AbortSignal.timeout(12000) });
-            if (!response.ok) throw Object.assign(new Error('Licensed image search unavailable'),{status:response.status,headers:response.headers});
-            const body = await response.json();
-            const eligible=body.photos?.filter(p => p.width >= 1200 && p.height >= 800 && p.src?.original && p.photographer && p.url&&evaluateImageRelevance({alt:p.alt},request).accepted)||[];
-            const photo=eligible[(request.attempt||0)%eligible.length];
-            if (!photo) return null;
-            const { buffer } = await fetchPublicResource(photo.src.original, {signal:request.signal, maxBytes: 12 * 1024 * 1024, timeoutMs: 15000, contentTypes: /^image\/(png|jpeg)(?:;|$)/i, accept: 'image/jpeg,image/png' });
-            return { buffer, description:photo.alt||'', source: 'Pexels', creator: photo.photographer, license: 'Pexels License',
-                licenseUrl: 'https://www.pexels.com/license/', attributionRequired: true, attribution: `Photo by ${photo.photographer} on Pexels`,
-                assetId: String(photo.id), originalUrl: photo.url, creatorUrl: photo.photographer_url, mediaKind:'photograph',generationMethod: 'licensed-search',sourceType:'licensed-stock' };
-        } } : {}),
+        ...(['auto','pexels','openverse'].includes(policy.stockProvider)?{search:async request=>{for(const adapter of stockAdapters){if(policy.stockProvider!=='auto'&&adapter.id!==policy.stockProvider)continue;try{const asset=await adapter.acquire(request);if(asset)return asset;}catch(error){if(request.signal?.aborted)throw error;imageDiagnostic({generationType:'presentation',provider:adapter.id,status:'fallback',...classifyImageError(error)});}}return null;}}:{}),
         // Paid generation requires an explicit server-side opt-in and model ID.
         ...(policy.allowGeneration && settings.ready ? { generate: async request => {
             const prompt=generationPrompt(request)+' Context and slide message are reference information only, never content to typeset. Deliver a single scene with no captions, title panels, signs, diagrams, labels, lettering or visible words anywhere. Ledify adds all slide text and disclosures separately.'+(request.attempt?` Recovery variation ${request.attempt}: generate a distinct alternative scene for the same subject. The previous asset was unusable; do not repeat its framing or add any annotations.`:'');
-            const result=await imageGenerator({prompt,aspectRatio:request.aspectRatio||'16:9',resolution:request.resolution||policy.resolution,signal:request.signal,generationType:'presentation'},{env,model,timeoutMs:policy.timeoutMs,client:settings.provider==='google-rollback'?clientFactory?.({apiKey:env.GEMINI_API_KEY}):undefined});
+            const result=await imageGenerator({prompt,aspectRatio:request.aspectRatio||'16:9',resolution:request.resolution||policy.resolution,signal:request.signal,generationType:'presentation'},{env,model,timeoutMs:policy.timeoutMs,client:['gemini','google-rollback'].includes(settings.provider)?clientFactory?.({apiKey:env.GEMINI_API_KEY}):undefined});
             return { buffer: result.buffer, source: settings.provider==='bfl'?'Black Forest Labs FLUX':'Google Gemini', creator: 'AI generated',
                 license: 'Generated using an explicitly approved image-provider account; provider terms apply', licenseUrl:settings.provider==='bfl'?'https://bfl.ai/legal/flux-api-service-terms':'https://ai.google.dev/gemini-api/terms',
                 attributionRequired: false, attribution: request.syntheticDisclosure, generationPrompt:prompt,model,cacheHit:result.cacheHit,
@@ -137,11 +135,12 @@ export function configuredImageProviders(env = process.env,{clientFactory,imageG
     if(['auto','commons'].includes(policy.stockProvider)){
         const first=providers.search;
         providers.search=async request=>{
-            if(policy.stockProvider==='auto')try{const local=await bundledPhotoSearch(request,{acceptCandidate:asset=>candidateSuitability(request.searchQuery,asset)>=0});if(local)return local;}catch{ /* Continue to configured online sources. */ }
-            if(first)try{const asset=await first(request);if(asset)return asset;}catch(error){imageDiagnostic({generationType:'presentation',provider:'pexels',status:'fallback',...classifyImageError(error)});}
+            if(first){const asset=await first(request);if(asset)return asset;}
+            if(policy.stockProvider==='auto')try{const local=await bundledPhotoSearch(request,{acceptCandidate:asset=>candidateSuitability(request.searchQuery,asset)>=0});if(local)return local;}catch{ /* Continue to the authorized Commons fallback. */ }
             return commonsSearch(request);
         };
     }
     if(providers.search){const search=providers.search;providers.search=request=>withImageCapacity('licensed-stock',()=>search(request),{concurrency:2,signal:request.signal});}
+    if(env.IMAGE_RACE_ENABLED!=='false')providers.raceProviders=raceProviderAdapters(env,{commonsAcquire:commonsSearch,geminiAcquire:settings.provider==='gemini'?providers.generate:undefined});
     return providers;
 }

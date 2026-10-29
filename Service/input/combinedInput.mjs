@@ -3,6 +3,7 @@ import {requestedTopics} from '../ai/presentationQuality.mjs';
 import {resolveSlideCount} from '../ai/slideCount.mjs';
 import {MAX_SOURCE_CHARACTERS} from './sourceLimits.mjs';
 import {validateTextPrompt} from './promptValidation.mjs';
+import {unpackUrlSource} from './urlUnderstanding.mjs';
 
 const invalid=message=>Object.assign(new Error(message),{code:'INVALID_REQUEST'});
 function optionalText(value,name,max) {
@@ -10,7 +11,7 @@ function optionalText(value,name,max) {
     if(typeof value!=='string'||value.length>max)throw invalid(`${name} must be text no longer than ${max} characters.`);
     return value.trim();
 }
-export async function combineGenerationInput({body,file,context,extractFile,extractUrl}) {
+export async function combineGenerationInput({body,file,context,extractFile,extractUrl,signal}) {
     const prompt=validateTextPrompt(body.textPrompt,{optional:true}),url=optionalText(body.urlPrompt,'urlPrompt',2048);
     if(!prompt&&!url&&!file)throw invalid('Type a prompt, provide a public URL, or attach a PDF or DOCX file.');
     const extraInstructions=optionalText(context.instructions,'context.instructions',20000);
@@ -19,7 +20,7 @@ export async function combineGenerationInput({body,file,context,extractFile,extr
         if(!['http:','https:'].includes(target.protocol)||target.username||target.password)throw invalid('Provide a public HTTP(S) URL without credentials.');
     }
     const instructions=[extraInstructions,prompt].filter(Boolean).join('\n\n');
-    const resolvedContext={...context,...(instructions?{instructions}: {})};
+    let resolvedContext={...context,...(instructions?{instructions}: {})};
     if(instructions){
         resolvedContext.keyInstructions=[...(Array.isArray(context.keyInstructions)?context.keyInstructions:[]),instructions];
         resolvedContext.requiredTopics=requestedTopics(instructions,context);
@@ -27,9 +28,10 @@ export async function combineGenerationInput({body,file,context,extractFile,extr
     if(body.outputType==='presentation')resolveSlideCount('',resolvedContext);
     // Reject invalid instructions or a bad attachment before URL requests/AI.
     if(file)await validateUploadedFile(file);
-    const results=await Promise.allSettled([file?extractFile(file):null,url?extractUrl(url):null]);
+    const results=await Promise.allSettled([file?extractFile(file):null,url?extractUrl(url,{context:resolvedContext,outputType:body.outputType,signal}):null]);
     const failure=results.find(result=>result.status==='rejected');if(failure)throw failure.reason;
-    const [fileText,urlText]=results.map(result=>result.value),sources=[];
+    const [fileText,urlResult]=results.map(result=>result.value),sources=[];
+    let urlText=urlResult;if(url){const source=unpackUrlSource(urlResult,url,resolvedContext);urlText=source.text;resolvedContext=source.context;}
     if(file){if(typeof fileText!=='string'||!fileText.trim())throw invalid('The attached file contains no readable text.');sources.push({type:'file',name:file.originalname});}
     if(url){if(typeof urlText!=='string'||!urlText.trim())throw invalid('The URL contains no readable text.');sources.push({type:'url',url});}
     if(prompt)sources.push({type:'prompt'});

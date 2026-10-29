@@ -39,7 +39,7 @@ test('image policy requires explicit cost configuration; retries reserve budget 
 test('text-only supporting slides retain the required cover and do not displace precise diagrams',()=>{
     const d=structuredClone(imagerySamples[0].presentation),planned=planImageCoverage(d);
     assert.equal(planned.imageCoveragePlan.target,6);assert.equal(planned.slides[6].visualRequirement.kind,'diagram');assert.equal(planned.slides[6].imageRequirement,undefined);
-    const no=planImageCoverage(d,{instructions:'No photographs please.'});assert.equal(no.imageCoveragePlan.target,1);assert.ok(no.slides[0].imageRequirement.required);assert.ok(!no.slides.slice(1).some(s=>s.visualRequirement.kind==='photo'));
+    const no=planImageCoverage(d,{instructions:'No photographs please.'});assert.equal(no.imageCoveragePlan.target,0);assert.equal(no.imageCoveragePlan.coverRequired,false);assert.ok(!no.slides.some(s=>s.imageRequirement));
     const reserved=planImageCoverage(d,{designPreferences:{noImageSlideNumbers:[8]}});assert.equal(reserved.slides[7].visualRequirement.kind,'none');assert.equal(reserved.imageCoveragePlan.target,5);
 });
 test('art direction records audience, message, focal point and synthetic disclosure',()=>{
@@ -147,7 +147,7 @@ test('Commons adapter retains genuine licenses and rejects unlicensed or synthet
 });
 test('configured image generation retains provenance without adding a visible synthetic label',async t=>{
     const root=await temp(t),buffer=await photoBuffer();let sent;
-    const env={...approvedImageEnv,PRESENTATION_STOCK_PROVIDER:'none',PRESENTATION_ALLOW_IMAGE_GENERATION:'true',PRESENTATION_IMAGE_ESTIMATED_UNIT_COST:'.1',PRESENTATION_IMAGE_MAX_ESTIMATED_COST:'.1'};
+    const env={...approvedImageEnv,IMAGE_RACE_ENABLED:'false',PRESENTATION_STOCK_PROVIDER:'none',PRESENTATION_ALLOW_IMAGE_GENERATION:'true',PRESENTATION_IMAGE_ESTIMATED_UNIT_COST:'.1',PRESENTATION_IMAGE_MAX_ESTIMATED_COST:'.1'};
     const providers=configuredImageProviders(env,{imageGenerator:async request=>{sent=request;return {buffer,cacheHit:false};}});
     const sample=structuredClone(imagerySamples[0]);sample.presentation.slides=sample.presentation.slides.slice(0,1);
     const ready=presentationRendererService(presentationThemeService(presentationLayoutService(sample.presentation),sample.context));

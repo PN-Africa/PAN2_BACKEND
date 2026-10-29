@@ -28,8 +28,9 @@ export function documentStyle(document,context={}) {
     const academic=/academic|research|essay/i.test(document.documentType),simple=/letter|resume/i.test(document.documentType);
     const long=document.length?.requestedPages>=8;
     const instructions=context.instructions||'';
-    const font=format.fontFamily||fonts.find(font=>instructions.toLowerCase().includes(font.toLowerCase()))||(academic?'Times New Roman':'Calibri');
-    const size=format.fontSize??Number(instructions.match(/\b(1[0-6])[- ](?:pt|point)\b/i)?.[1]||(academic?12:11)),lineSpacing=format.lineSpacing??(/double[- ]spac/i.test(instructions)?2:/single[- ]spac/i.test(instructions)?1:long?1:academic?1.35:1.15),margin=format.marginInches??(long?.75:1);
+    const recommended=process.env.LEDIFY_DESIGN_ENGINE==='legacy'?undefined:{humanist:'Calibri',editorial:'Georgia',technical:'Arial',classical:'Times New Roman',geometric:'Arial'}[document.artifactDesign?.theme.fontPair];
+    const font=format.fontFamily||fonts.find(font=>instructions.toLowerCase().includes(font.toLowerCase()))||recommended||(academic?'Times New Roman':'Calibri');
+    const size=format.fontSize??Number(instructions.match(/\b(1[0-6])[- ](?:pt|point)\b/i)?.[1]||(academic?12:11)),lineSpacing=format.lineSpacing??(/double[- ]spac/i.test(instructions)?2:/single[- ]spac/i.test(instructions)?1:long?1:document.artifactDesign&&process.env.LEDIFY_DESIGN_ENGINE!=='legacy'?({compact:1.15,balanced:1.35,spacious:1.5}[document.artifactDesign.theme.spacing]):academic?1.35:1.15),margin=format.marginInches??(long?.75:1);
     if(!fonts.includes(font)||!Number.isFinite(size)||size<10||size>16||!Number.isFinite(lineSpacing)||lineSpacing<1||lineSpacing>2.5||!Number.isFinite(margin)||margin<0.5||margin>1.5||!['A4','Letter'].includes(format.paperSize||'A4')) throw Object.assign(new Error('Unsupported document formatting. Choose a supported font, 10–16 pt, 1–2.5 line spacing, 0.5–1.5 inch margins, and A4 or Letter.'),{code:'INVALID_DOCUMENT_FORMATTING'});
     const explicitCover=/\b(?:include|with|add|separate) (?:a |an )?(?:cover|title) page\b/i.test(instructions);
     const cover=(format.coverPage??(document.coverPage&&(!long||explicitCover)))&&!simple;
@@ -65,7 +66,8 @@ export async function renderDocumentDocx(document,context={}) {
     // Without lineRule, Writer can interpret the inherited 276 as fixed twips.
     const bodySpacing={after:style.long?100:160,line:Math.round(style.lineSpacing*240),lineRule:LineRuleType.AUTO};
     const text=(value,options={})=>new TextRun({text:value,...options});
-    const para=(value,options={})=>new Paragraph({children:String(value).split(/\r?\n/).flatMap((line,i)=>[...(i?[new TextRun({break:1})]:[]),text(line)]),widowControl:true,spacing:bodySpacing,...options});
+    let component='prose';
+    const para=(value,options={})=>new Paragraph({children:String(value).split(/\r?\n/).flatMap((line,i)=>[...(i?[new TextRun({break:1})]:[]),text(line)]),widowControl:true,spacing:{...bodySpacing,...(component==='reference'?{after:100}:component==='report'?{after:220}:{})},...options});
     const heading=(value,level=1)=>para(value,{heading:[HeadingLevel.HEADING_1,HeadingLevel.HEADING_2,HeadingLevel.HEADING_3][level-1],keepNext:true});
     const caption=value=>para(value,{style:'Caption',keepNext:false});
     const header=new Header({children:[para(document.title,{style:'Header',spacing:{after:0}})]});
@@ -79,6 +81,7 @@ export async function renderDocumentDocx(document,context={}) {
         sections.push({properties:{page:{size:pageSize('portrait'),margin:{top:style.margin,bottom:style.margin,left:style.margin,right:style.margin}}},children});children=[];
     }
     for(const section of document.sections) {
+        component=section.designComponent||'prose';
         if(!/letter/i.test(document.documentType))children.push(heading(section.heading));
         for(const block of section.blocks) {
             const citations=(block.referenceIds||[]).map(id=>references.findIndex(ref=>ref.id===id)+1).filter(n=>n>0);
@@ -134,7 +137,7 @@ export async function renderDocumentDocx(document,context={}) {
         }
     }
     flush();
-    const black={color:'000000'};
+    const black={color:process.env.LEDIFY_DESIGN_ENGINE!=='legacy'&&document.artifactDesign?document.artifactDesign.theme.colors.text.slice(1):'000000'};
     const doc=new Document({creator:typeof context.author==='string'?context.author:'Ledify',title:document.title,description:document.purpose||'',styles:{default:{document:{run:{font:style.font,size:style.size*2,...black},paragraph:{spacing:bodySpacing,widowControl:true}},title:{run:{font:style.font,size:/letter/i.test(document.documentType)?24:48,bold:true,...black},paragraph:{spacing:{before:0,after:200},keepNext:true}},heading1:{run:{font:style.font,size:32,bold:true,...black},paragraph:{spacing:{before:260,after:120},keepNext:true}},heading2:{run:{font:style.font,size:26,bold:true,...black},paragraph:{spacing:{before:200,after:100},keepNext:true}},heading3:{run:{font:style.font,size:24,bold:true,...black},paragraph:{spacing:{before:160,after:80},keepNext:true}}},paragraphStyles:[{id:'Subtitle',name:'Subtitle',basedOn:'Normal',run:{size:26,...black},paragraph:{spacing:{after:200}}},{id:'Caption',name:'Caption',basedOn:'Normal',run:{size:19,...black},paragraph:{spacing:{before:80,after:140}}},{id:'Code',name:'Code',basedOn:'Normal',run:{font:'Courier New',size:19,...black}},{id:'Header',name:'Header',basedOn:'Normal',run:{size:18,...black}},{id:'Footer',name:'Footer',basedOn:'Normal',run:{size:18,...black}},{id:'Quote',name:'Quote',basedOn:'Normal',run:{italics:true}}]},numbering:{config:numbering},sections});
     return Packer.toBuffer(doc);
 }

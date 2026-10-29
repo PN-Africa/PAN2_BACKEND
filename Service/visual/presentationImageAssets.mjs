@@ -7,16 +7,18 @@ import {imageBrief} from './imageArtDirection.mjs';
 import {PHOTO_FRAMES} from '../../renderer/presentation/photoCompositions.mjs';
 import {imageSpecificationSchema} from '../../templates/presentation/visualSchemas.mjs';
 import {validateSchema} from '../ai/responseValidation.mjs';
-import {storeImageAsset,atomicImageJson,classifyImageError,imageBackoff,imageDiagnostic,validateImageBytes} from './imageAssetService.mjs';
+import {storeImageAsset,atomicImageJson,classifyImageError,imageBackoff,imageDiagnostic,validateImageBytes,withImageCapacity} from './imageAssetService.mjs';
 import {evaluateImageRelevance,relevanceDiagnostic} from './imageRelevance.mjs';
-import {bindImageAsset} from './assetBinding.mjs';
-import {performanceRequestId,measureStage} from '../performance.mjs';
+import {bindImageAsset,assertImageBinding} from './assetBinding.mjs';
+import {performanceRequestId,measureStage,generationSignal} from '../performance.mjs';
+import {acquireRacingImage} from './imageRaceProviders.mjs';
 
-export async function normalizePhoto(asset,brief,root,policy){
+export async function normalizePhoto(asset,brief,root,policy,{persist=true,reframeRequestId}={}){
     if(!asset?.source||!asset.creator||!asset.license||(asset.attributionRequired&&!asset.attribution))throw new Error('Incomplete image usage rights or provenance');
     if(!Buffer.isBuffer(asset.buffer)||asset.buffer.length>12*1024*1024)throw new Error('Image exceeds byte limit');
+    if(reframeRequestId)assertImageBinding(asset,{requestId:reframeRequestId,target:brief,bytes:asset.buffer});
     const input=sharp(asset.buffer,{limitInputPixels:32000000,failOn:'error'}),meta=await input.metadata();
-    if(!['jpeg','png','webp'].includes(meta.format)||meta.pages>1||meta.width<800||meta.height<600)throw new Error('Unsupported, animated or insufficient-resolution image');
+    if(!['jpeg','png','webp'].includes(meta.format)||meta.pages>1||!reframeRequestId&&(meta.width<800||meta.height<600))throw new Error('Unsupported, animated or insufficient-resolution image');
     const oriented=await input.rotate().flatten({background:'#'+String(brief.palette?.background||'FFFFFF').replace('#','')}).toBuffer(),dimensionsIn=await sharp(oriented).metadata();
     const sourceStats=await sharp(oriented).stats();
     if(sourceStats.channels.every(c=>c.stdev<2))throw new Error('Image is blank or visually uniform');
@@ -28,7 +30,7 @@ export async function normalizePhoto(asset,brief,root,policy){
     if(cropW/frame.w<90||cropH/frame.h<90)throw new Error('Source resolution is insufficient after the requested crop');
     const buffer=await sharp(oriented).extract({left,top,width:cropW,height:cropH}).resize({width:2400,height:1800,fit:'inside',withoutEnlargement:true}).jpeg({quality:policy.quality,mozjpeg:true}).toBuffer();
     const dimensions=await sharp(buffer).metadata(),id=createHash('sha256').update(buffer).digest('hex');
-    const stored=await storeImageAsset(buffer,{root}),filePath=stored.filePath;
+    const stored=persist?await storeImageAsset(buffer,{root}):{},filePath=stored.filePath;
     const {buffer:unused,...metadata}=asset;
     return {...metadata,id,sourceChecksum:createHash('sha256').update(asset.buffer).digest('hex'),filePath,data:'image/jpeg;base64,'+buffer.toString('base64'),kind:'photo',role:'foreground',status:'resolved',
         sourceType:asset.sourceType||(asset.generationMethod==='ai-generated'?'ai-generated':'licensed-stock'),
@@ -48,6 +50,23 @@ export function createImageAssetSession({providers={},policy=imagePolicy(),root,
     let selected=0,cancelled=false;const controllers=new Set();
     return {diagnostics,budget,requestId,
         cancel(){cancelled=true;for(const controller of controllers)controller.abort();},
+        async reframe(asset,presentation,slide,theme,context){
+            if(cancelled)return null;
+            const brief=imageBrief(presentation,slide,theme,context);
+            // Reuse only the exact verified image owned by this request/slot.
+            // Context binding excludes composition but checks subject and query.
+            assertImageBinding(asset,{requestId,target:brief});
+            return limited(()=>measureStage('presentation-image-reframe',async()=>{
+                const buffer=Buffer.from(asset.data.split('base64,')[1],'base64');
+                // This is an already validated crop, not a new low-resolution
+                // source. The target's 90 effective PPI floor still applies.
+                const reframed=await normalizePhoto({...asset,buffer},brief,root,policy,{reframeRequestId:requestId});
+                if(reframed.id!==asset.id&&used.has(reframed.id))throw new Error('Duplicate image in presentation');
+                used.add(reframed.id);
+                record({slideNumber:slide.slideNumber,method:'reframe',status:'resolved',storage:'saved',validation:'passed'});
+                return bindImageAsset({...reframed,reframedFrom:asset.id},brief,requestId);
+            }));
+        },
         async resolve(presentation,slide,theme,context,directOverride){
             if(cancelled||!policy.enabled||selected>=policy.maxImages){record({slideNumber:slide.slideNumber,status:'skipped',reasonCode:cancelled?'CANCELLED':!policy.enabled?'IMAGES_DISABLED':'IMAGE_LIMIT_REACHED'});return null;}selected++;
             const brief=imageBrief(presentation,slide,theme,context);
@@ -55,11 +74,31 @@ export function createImageAssetSession({providers={},policy=imagePolicy(),root,
             if(directOverride){brief.description=directOverride.description;brief.altText=directOverride.description;brief.composition=directOverride.composition||brief.composition;}
             if(cancelled||Date.now()>=deadline){record({slideNumber:slide.slideNumber,status:'skipped',reasonCode:cancelled?'CANCELLED':'DECK_DEADLINE_REACHED',reason:cancelled?'Deck image acquisition cancelled':'Deck image deadline reached'});return null;}
             const direct=directOverride||userAssets.find(a=>a.slideNumber===slide.slideNumber);
-            const preference=brief.authenticPhotoOnly?['search']:brief.sourceStrategy==='licensed-search-first'?['search','generate']:['generate','search'];
+            if(!direct&&external&&providers.raceProviders){
+                return limited(async()=>{
+                    const controller=new AbortController();controllers.add(controller);let reservation;
+                    try{
+                        const signal=generationSignal()?AbortSignal.any([controller.signal,generationSignal()]):controller.signal;
+                        const candidate=await acquireRacingImage(providers.raceProviders,{...brief,generationType:'presentation',requestId,signal},{reserveGeneration:()=>budget.reserve(),timeoutMs:Math.min(policy.timeoutMs,Math.max(1,deadline-Date.now())),logger:providers.raceLogger,validate:async(asset,provider,{signal})=>{
+                            const sourceKey=createHash('sha256').update(asset.buffer).digest('hex');if(usedSources.has(sourceKey))throw Object.assign(new Error('Duplicate image'),{code:'IMAGE_DUPLICATE'});
+                            const prepared=await withImageCapacity('race-photo-processing',()=>normalizePhoto(asset,brief,root,policy,{persist:false}),{concurrency:2,signal});if(used.has(prepared.id))throw Object.assign(new Error('Duplicate image'),{code:'IMAGE_DUPLICATE'});asset.racePrepared=prepared;
+                            return true;
+                        }});
+                        if(!candidate)return null;
+                        const asset=candidate.racePrepared,sourceKey=asset.sourceChecksum;
+                        if(usedSources.has(sourceKey)||used.has(asset.id))return null;usedSources.add(sourceKey);reservation=sourceKey;used.add(asset.id);
+                        const bytes=Buffer.from(asset.data.split('base64,')[1],'base64'),stored=await storeImageAsset(bytes,{root});
+                        record({slideNumber:slide.slideNumber,method:candidate.raceWinner,status:'resolved',storage:'saved',validation:'passed'});
+                        return bindImageAsset({...asset,filePath:stored.filePath,raceWinner:candidate.raceWinner},brief,requestId);
+                    }catch(error){if(reservation)usedSources.delete(reservation);record({slideNumber:slide.slideNumber,method:'race',status:'failed',...classifyImageError(error)});return null;}
+                    finally{controller.abort();controllers.delete(controller);}
+                });
+            }
+            const preference=brief.authenticPhotoOnly?['search']:brief.conceptImage?['generate','search']:['search','generate'];
             const methods=direct?['user',...(external?preference:[])]:external?preference:[];
             if(!methods.some(method=>method==='user'||providers[method]))record({slideNumber:slide.slideNumber,status:'skipped',reasonCode:brief.authenticPhotoOnly?'AUTHENTIC_PHOTO_PROVIDER_UNAVAILABLE':'IMAGE_PROVIDER_UNAVAILABLE'});
             for(const method of methods){
-                if(method!=='user'&&!providers[method])continue;
+                if(method!=='user'&&!providers[method]){if(method==='generate')record({slideNumber:slide.slideNumber,method,status:'skipped',reasonCode:policy.generationStatus||'IMAGE_PROVIDER_UNAVAILABLE'});continue;}
                 // Exact scientific diagrams may never be replaced by synthetic pictures.
                 if(method==='generate'&&(brief.kind==='diagram'||/precise anatomy|histolog|diagnostic (?:scan|image)|radiograph/i.test(brief.description)))continue;
                 const identity=method==='user'?direct.assetId||'user':(providers.identity||'injected-provider')+(method==='search'?':licensed-search-v3':'');
@@ -77,7 +116,7 @@ export function createImageAssetSession({providers={},policy=imagePolicy(),root,
                         if(!usedSources.has(meta.sourceChecksum)&&!used.has(meta.id)){used.add(meta.id);usedSources.add(meta.sourceChecksum);record({slideNumber:slide.slideNumber,method,status:'resolved',cacheHit:true,model:meta.model});return bindImageAsset({...meta,filePath,data:'image/jpeg;base64,'+buffer.toString('base64'),cacheHit:true},brief,requestId);}
                     }
                 }catch{}
-                for(let attempt=0;attempt<=policy.retries;attempt++){
+                for(let attempt=0;attempt<=(method==='search'?Math.min(1,policy.retries):policy.retries);attempt++){
                     if(cancelled||Date.now()>=deadline)break;
                     // A slot covers one attempt, not a slide's entire retry
                     // chain. Failed attempts rejoin behind waiting slides.
@@ -96,7 +135,7 @@ export function createImageAssetSession({providers={},policy=imagePolicy(),root,
                         controllers.add(controller);
                         try{
                             const candidate=method==='user'?direct:await Promise.race([
-                                providers[method]({...brief,attempt,...(method==='search'?{maxSearchQueries:3}:{}),excludeAssetIds:[...used],excludeSourceChecksums:[...usedSources],signal:controller.signal,resolution:policy.resolution}),
+                                providers[method]({...brief,attempt,...(method==='search'?{maxSearchQueries:1}:{}),excludeAssetIds:[...used],excludeSourceChecksums:[...usedSources],signal:controller.signal,resolution:policy.resolution}),
                                 new Promise((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error('Image provider timed out'));},Math.min(attemptTimeout,Math.max(1,deadline-Date.now())));})]);
                             if(!candidate){record({slideNumber:slide.slideNumber,method,status:'empty',reasonCode:'NO_ELIGIBLE_IMAGE',attempt:attempt+1});return {stop:true};}
                             if(brief.authenticPhotoOnly&&(candidate.generationMethod==='ai-generated'||candidate.synthetic||candidate.mediaKind&&candidate.mediaKind!=='photograph'))throw new Error('Authentic photography required; synthetic or non-photographic asset rejected');

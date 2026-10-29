@@ -1,3 +1,4 @@
+import {designPlanSchema} from '../../Service/design/designSchema.mjs';
 const string = { type: 'string' };
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 export const PAGE_TYPES = ['portfolio', 'startup', 'business', 'education', 'restaurant', 'event', 'product', 'agency', 'nonprofit', 'service', 'informational', 'ecommerce'];
@@ -8,7 +9,7 @@ export const INDUSTRIES = ['healthcare', 'hospitality', 'technology', 'creative'
 export const HERO_COMPOSITIONS=['split','editorial','image-led','product','full-bleed','asymmetric','minimal'];
 export const FONT_PAIRS=['humanist','editorial','technical','classical','geometric','display','mono'];
 export const PALETTE_IDS=['auto','navy-jade','aubergine-sand','charcoal-saffron','wine-linen','forest-brass','ink-burgundy','cobalt-sand','graphite-lime','plum-ivory','midnight-electric','ocean-night','terracotta','sunflower','midnight-blue','champagne-ivory','clinical-teal','scholar-blue','emerald-ink','moss-stone'];
-export const BACKGROUNDS=['plain','tinted','brand','accent','dark','gradient','texture','split'];
+export const BACKGROUNDS=['plain','tinted','brand','accent','dark','gradient','texture','split','light'];
 export const creativeDirectionSchema=object({concept:string,personality:string,background:{type:'string',enum:BACKGROUNDS},spacing:{type:'string',enum:['compact','balanced','generous']},geometry:{type:'string',enum:['square','soft','round']},typeScale:{type:'string',enum:['restrained','balanced','expressive']},ctaStyle:{type:'string',enum:['solid','outline','pill']},interactions:{type:'array',maxItems:3,items:{type:'string',enum:['search','filter','gallery']}}});
 const context = object({ userRole: string, purpose: string, audience: string, topic: string, tone: string, keyInstructions: { type: 'array', items: string, maxItems: 8 } });
 export const webpagePlanSchema = object({
@@ -35,6 +36,7 @@ webpagePlanSchema.properties.pages={type:'array',minItems:1,maxItems:6,items:obj
 // Combined nested image plans + section backgrounds + direction were rejected
 // by Gemini even though each extension alone was accepted. The image strategy
 // compiles concrete targets from the returned content and photographic direction.
+webpagePlanSchema.properties.artifactDesign=designPlanSchema('webpage');
 export function webpagePlanningProviderSchema(){
     const schema=structuredClone(webpagePlanSchema);
     delete schema.properties.imagePlan;

@@ -11,7 +11,7 @@ process.once('message',async({directory,pages})=>{
         const app=express();app.use(express.static(path.join(directory,'site')));
         server=await new Promise(resolve=>{const instance=app.listen(0,'127.0.0.1',()=>resolve(instance));});
         const base=`http://127.0.0.1:${server.address().port}`,failures=[],checks=[];
-        for(const file of pages)for(const width of [360,768,1440]){
+        for(const file of pages)for(const width of [320,390,768,1024,1440]){
             const context=await browser.newContext({viewport:{width,height:900},reducedMotion:'reduce'}),page=await context.newPage();
             await page.route('**/*',route=>route.request().url().startsWith(base+'/')?route.continue():route.abort());
             page.on('pageerror',()=>failures.push({code:'script-error',file,width}));

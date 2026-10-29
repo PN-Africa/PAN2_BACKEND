@@ -1,11 +1,12 @@
 import {contrast,foreground} from '../webpageThemeService.mjs';
+import {projectColorRoles} from '../design/colorSystem.mjs';
 export const blend=(a,b,weight)=>'#'+a.slice(1).match(/../g).map((v,i)=>Math.round(parseInt(v,16)*(1-weight)+parseInt(b.slice(1+i*2,3+i*2),16)*weight).toString(16).padStart(2,'0')).join('');
 function readable(preferred,backgrounds,threshold=4.5){
     if(backgrounds.every(background=>contrast(preferred,background)>=threshold))return preferred;
     return ['#000000','#ffffff'].sort((a,b)=>Math.min(...backgrounds.map(bg=>contrast(b,bg)))-Math.min(...backgrounds.map(bg=>contrast(a,bg))))[0];
 }
 export function completeVisualTokens(colors){
-    const c={...colors};
+    const c={...colors,...projectColorRoles(colors)};
     c.alternateBackground=blend(c.background,c.primary,.1);c.elevatedSurface=blend(c.surface,c.primary,.04);c.cardSurface=c.surface;
     c.heading=c.text;c.body=c.text;c.buttonBackground=c.primary;c.buttonText=c.onPrimary;c.secondaryAccent=c.secondary;
     c.rule=blend(c.background,c.text,.13);
@@ -13,9 +14,9 @@ export function completeVisualTokens(colors){
     return c;
 }
 export function sectionVisualTokens(root,treatment){
-    let background=treatment==='tinted'?root.alternateBackground:treatment==='brand'?root.primary:treatment==='accent'?blend(root.background,root.accent,.14):treatment==='dark'?'#10181f':root.background;
+    let background=treatment==='tinted'?root.alternateBackground:treatment==='brand'?root.primary:treatment==='accent'?root.highlightSurface:treatment==='light'?root.lightSurface:['dark','gradient'].includes(treatment)?root.darkSurface:root.background;
     const surfaces=[background];
-    if(treatment==='gradient')surfaces.push(blend(background,root.accent,.08));
+    if(treatment==='gradient')surfaces.push(root.gradientEnd);
     if(treatment==='texture')surfaces.push(blend(background,root.text,.03));
     if(treatment==='split')surfaces.push(root.surface);
     const text=readable(root.text,surfaces),muted=readable(root.muted,surfaces);

@@ -9,6 +9,7 @@ import {renderPhotoComposition} from './photoCompositions.mjs';
 import {photoCompositionFor} from '../../Service/visual/imageArtDirection.mjs';
 import {presentationFontSize} from './typography.mjs';
 import {isAutomaticImageLabel} from '../imageLabels.mjs';
+import {visualCaptionBoxes} from './visualLayout.mjs';
 
 const W = 13.333333, H = 7.5, M = .72, CW = W - M * 2;
 const luminance = hex => {
@@ -27,16 +28,17 @@ export function renderProfessionalSlide(args) {
     renderSlide({...args,slide:recorder.slide});
     return recorder.validate();
 }
-function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
+function renderSlide({ slide, slideData: d, tokens = {}, pptx, validationErrors, onTextLayout, skipContentValidation=false }) {
     if (d.slideType === 'focused-explanation' && !d.content?.textContent?.body?.trim()) {
         throw Object.assign(new Error(`Slide ${d.slideNumber}: content.textContent.body must contain meaningful text`), { field: 'content.textContent.body', slideNumber: d.slideNumber });
     }
-    validateSlideContent({slideNumber:d.slideNumber,slideType:d.slideType,title:d.title,subtitle:d.subtitle,content:d.content});
+    if(!skipContentValidation)validateSlideContent({slideNumber:d.slideNumber,slideType:d.slideType,title:d.title,subtitle:d.subtitle,content:d.content});
     const c = getColors(tokens), t = getTypography(tokens);
     const ink = readable(c.textPrimary, c.background), muted = readable(c.textSecondary, c.background);
     const accent = readable(c.accent, c.background, 3);
-    if(d.photoAsset&&renderPhotoComposition({slide,d,c,t,ink,muted,accent}))return;
+    if(d.photoAsset&&renderPhotoComposition({slide,d,c,t,ink,muted,accent,validationErrors,onTextLayout}))return;
     slide.background = { color: c.background };
+    if(d.surfaceArt)slide.addImage({data:d.surfaceArt,x:0,y:0,w:W,h:H,altText:''});
     if (d.backgroundAsset?.data) slide.addImage({data:d.backgroundAsset.data,x:0,y:0,w:W,h:H,altText:''});
     const rect = (x, y, w, h, color) => slide.addShape('rect', { x, y, w, h, line: { color, transparency: 100 }, fill: { color } });
     const text = (value, x, y, w, h, size = 22, extra = {}, field = 'content') => {
@@ -44,9 +46,11 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
         if(field==='visual.caption'&&isAutomaticImageLabel(value))return;
         size=presentationFontSize(field,{bold:extra.bold});
         value = String(value);
-        assertTextFits(value, { w, h, fontSize: size }, field, d.slideNumber);
+        const {sourceOverhead=0,...drawExtra}=extra;
+        onTextLayout?.({field,w,h,fontSize:size,overhead:sourceOverhead});
+        try{assertTextFits(value, { w, h, fontSize: size }, field, d.slideNumber);}catch(error){if(sourceOverhead)error.maxCharacters=Math.max(1,error.maxCharacters-sourceOverhead);if(!validationErrors)throw error;validationErrors.push(error);}
         slide.addText(value, { x, y, w, h, fontFace: t.bodyFamily, fontSize: size, color: ink,
-            margin: 0, breakLine: false, valign: 'top', paraSpaceAfterPt: 6, ...extra, _field:field });
+            margin: 0, breakLine: false, valign: 'top', paraSpaceAfterPt: 6, ...drawExtra, _field:field });
     };
     const rule = (x, y, w = .65) => rect(x, y, w, .045, accent);
     const max = (items, limit, field) => {
@@ -60,7 +64,7 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
     if (type === 'title' || type === 'section-divider') {
         const v = content.titleContent || content.sectionContent;
         if(d.layoutId==='title-editorial'){
-            const bg=ink,fg=readable(c.background,bg),secondary=readable(c.surfaceSecondary,bg);
+            const bg=c.background,fg=ink,secondary=muted;
             slide.background={color:bg};
             text(v.title,M,1.25,CW-.35,2.5,44,{bold:true,fontFace:t.headingFamily,color:fg},'title.title');
             text(v.subtitle,M,4.18,CW-1,1.1,25,{color:secondary},'title.subtitle');
@@ -82,19 +86,20 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
     rule(M, 2.17);
     const top = 2.4, bottom = 6.98, space = bottom - top;
     if(d.resolvedVisual && !content.visualContent && !content.process && !content.relationship && !content.chart && !content.table){
+        const caption=d.resolvedVisual.caption,boxes=visualCaptionBoxes(caption,{wide:d.visualCaptionWide,slideNumber:d.slideNumber});
         const body=[];
         const collect=(value,key='')=>{if(['id','from','to','type','searchQuery'].includes(key))return;
             if(typeof value==='string' && value && value!==d.title)body.push(value);
             else if(Array.isArray(value))value.forEach(v=>collect(v));
             else if(value&&typeof value==='object')Object.entries(value).forEach(([k,v])=>collect(v,k));};
         collect(content);
-        text(body.join('\n'),M,top+.15,5.4,3.95,20,{},'content.visualLayout');
-        if(d.resolvedVisual.diagram) renderNativeDiagram({slide,diagram:d.resolvedVisual.diagram,box:{x:6.45,y:top-.1,w:6.15,h:3.9},ink,accent,fontFace:t.bodyFamily,slideNumber:d.slideNumber});
+        text(body.join('\n'),M,top+.15,5.4,Math.min(3.95,boxes.bodyBottom-top-.15),20,{},'content.visualLayout');
+        if(d.resolvedVisual.diagram) renderNativeDiagram({slide,diagram:d.resolvedVisual.diagram,box:boxes.visual,ink,accent,fontFace:t.bodyFamily,slideNumber:d.slideNumber,validationErrors,onTextLayout});
         else {
-            const visual=d.resolvedVisual,scale=Math.min(6.15/visual.width,3.9/visual.height),w=visual.width*scale,h=visual.height*scale;
-            slide.addImage({data:visual.data,x:6.45+(6.15-w)/2,y:top+.15+(3.9-h)/2,w,h,altText:visual.altText});
+            const visual=d.resolvedVisual,scale=Math.min(6.15/visual.width,boxes.visual.h/visual.height),w=visual.width*scale,h=visual.height*scale;
+            slide.addImage({data:visual.data,x:6.45+(6.15-w)/2,y:boxes.visual.y+(boxes.visual.h-h)/2,w,h,altText:visual.altText});
         }
-        text(d.resolvedVisual.caption,6.45,6.35,6.15,.65,17,{color:muted},'visual.caption');return;
+        text(caption,boxes.caption.x,boxes.caption.y,boxes.caption.w,boxes.caption.h,18,{color:muted},'visual.caption');return;
     }
     const grid = (items, field, mode = 'cards') => {
         max(items, limits[field], field);
@@ -134,6 +139,14 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
             });return;
         }
         return grid(steps,'process.steps','list');
+    }
+    if (content.timeline && content.timeline.events.length>=4) {
+        const events=max(content.timeline.events,limits['timeline.events'],'timeline.events'),gap=.1,cols=2,rows=Math.ceil(events.length/cols),w=(CW-gap)/cols,h=(space-gap*(rows-1))/rows;
+        events.forEach((event,i)=>{const x=M+i%cols*(w+gap),y=top+Math.floor(i/cols)*(h+gap);
+            text(event.label,x,y,1.6,.7,20,{bold:true,color:accent},`timeline.events[${i}].label`);
+            text(event.title,x+1.8,y,w-1.8,.7,20,{bold:true},`timeline.events[${i}].title`);
+            text(event.description,x,y+.74,w,h-.76,18,{},`timeline.events[${i}].description`);
+        });return;
     }
     if (content.timeline && d.layoutId!=='timeline-horizontal') {
         const events=max(content.timeline.events,limits['timeline.events'],'timeline.events'),h=space/events.length;
@@ -178,6 +191,9 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
     }
     if (content.comparison) {
         const items = max(content.comparison.items, limits['comparison.items'], 'comparison.items'), gap = .4, w = (CW - gap * (items.length - 1)) / items.length;
+        if(items.length===3){const rh=space/3;
+            items.forEach((v,i)=>{const y=top+i*rh;rule(M,y);text(v.label,M,y+.12,2.7,rh-.2,20,{bold:true},`comparison.items[${i}].label`);const points=max(v.points,limits['comparison.items.points'],'comparison.points'),ph=(rh-.12)/points.length;points.forEach((p,j)=>text(`• ${p}`,M+3.1,y+j*ph,CW-3.1,ph-.02,18,{},`comparison.items[${i}].points[${j}]`));});return;
+        }
         items.forEach((v, i) => {
             const x = M + i * (w + gap);
             rule(x, top); text(v.label, x, top + .3, w, 1, 26, { bold: true }, `comparison.items[${i}].label`);
@@ -246,8 +262,8 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
         const roots=nodes.filter(n=>!links.some(r=>r.to===n.id));
         if(roots.length===1&&links.length===nodes.length-1&&links.every(r=>r.from===roots[0].id)){
             const root=roots[0],leaves=nodes.filter(n=>n!==root),gap=.35,w=(CW-gap*(leaves.length-1))/leaves.length;
-            text(root.label,M+CW/2-2.2,top,4.4,.7,26,{bold:true,align:'center'},'relationship.root.label');
-            text(root.description,M+CW/2-3.2,top+.8,6.4,.7,20,{align:'center'},'relationship.root.description');
+            text(root.label,M+CW/2-2.2,top,4.4,.7,26,{bold:true,align:'center'},`relationship.nodes[${nodes.indexOf(root)}].label`);
+            text(root.description,M+CW/2-3.2,top+.8,6.4,.7,20,{align:'center'},`relationship.nodes[${nodes.indexOf(root)}].description`);
             const busY=top+1.7;
             slide.addShape('line',{x:M+CW/2,y:top+1.45,w:0,h:.25,line:{color:accent,width:1.5}});
             const centers=leaves.map((n,i)=>M+i*(w+gap)+w/2);
@@ -255,12 +271,11 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
             leaves.forEach((node,i)=>{const x=M+i*(w+gap),edge=links.find(r=>r.to===node.id);
                 slide.addShape('line',{x:centers[i],y:busY,w:0,h:.1,line:{color:accent,width:1.5}});
                 slide.addShape('line',{x:centers[i],y:top+2.35,w:0,h:.18,line:{color:accent,width:1.5,endArrowType:'triangle'}});
-                text(edge.label,x,top+1.85,w,.45,18,{align:'center',color:muted},`relationship.edges[${i}].label`);
-                text(node.label,x,top+2.65,w,.9,24,{bold:true},`relationship.nodes[${i}].label`);
-                text(node.description,x,top+3.68,w,.85,20,{},`relationship.nodes[${i}].description`);
+                text(edge.label,x,top+1.85,w,.45,18,{align:'center',color:muted},`relationship.relationships[${links.indexOf(edge)}].label`);
+                text(node.label,x,top+2.65,w,.9,24,{bold:true},`relationship.nodes[${nodes.indexOf(node)}].label`);
+                text(node.description,x,top+3.68,w,.85,20,{},`relationship.nodes[${nodes.indexOf(node)}].description`);
             });return;
         }
-        const names = Object.fromEntries(nodes.map(n => [n.id, n.label]));
         const starts=nodes.filter(n=>!links.some(r=>r.to===n.id));
         if(starts.length===1 && links.length===nodes.length-1 && nodes.every(n=>links.filter(r=>r.from===n.id).length<=1)){
             const ordered=[];let current=starts[0];
@@ -269,20 +284,20 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
                 if(d.layoutId==='relationship-chain-vertical'){
                     const h=space/ordered.length;
                     ordered.forEach((node,i)=>{const y=top+i*h;
-                        text(node.label,M+.45,y,3.15,h-.1,22,{bold:true},`relationship.nodes[${i}].label`);
-                        text(node.description,M+3.9,y,5.2,h-.1,20,{},`relationship.nodes[${i}].description`);
+                        text(node.label,M+.45,y,3.15,h-.1,22,{bold:true},`relationship.nodes[${nodes.indexOf(node)}].label`);
+                        text(node.description,M+3.9,y,5.2,h-.1,20,{},`relationship.nodes[${nodes.indexOf(node)}].description`);
                         const edge=links.find(r=>r.from===node.id);
-                        if(edge){text(edge.label,M+9.45,y,2.4,h-.1,18,{color:muted},`relationship.relationships[${i}].label`);
+                        if(edge){text(edge.label,M+9.45,y,2.4,h-.1,18,{color:muted},`relationship.relationships[${links.indexOf(edge)}].label`);
                             slide.addShape('line',{x:M+.15,y:y+.4,w:0,h:h-.42,line:{color:accent,width:1.4,endArrowType:'triangle'}});}
                     });return;
                 }
                 const gap=.28,w=(CW-gap*(nodes.length-1))/nodes.length;
                 ordered.forEach((node,i)=>{const x=M+i*(w+gap);
                     rule(x,top+1.05,w-.15);
-                    text(node.label,x,top+1.35,w,1.1,22,{bold:true},`relationship.nodes[${i}].label`);
-                    text(node.description,x,top+2.65,w,1.45,18,{},`relationship.nodes[${i}].description`);
+                    text(node.label,x,top+1.35,w,1.1,22,{bold:true},`relationship.nodes[${nodes.indexOf(node)}].label`);
+                    text(node.description,x,top+2.65,w,1.45,18,{},`relationship.nodes[${nodes.indexOf(node)}].description`);
                     const edge=links.find(r=>r.from===node.id);
-                    if(edge){text(edge.label,x,top+.05,w,.75,18,{color:muted},`relationship.relationships[${i}].label`);
+                    if(edge){text(edge.label,x,top+.05,w,.75,18,{color:muted},`relationship.relationships[${links.indexOf(edge)}].label`);
                         slide.addShape('line',{x:x+.15,y:top+.87,w:w+.05,h:0,line:{color:accent,width:1.5,endArrowType:'triangle'}});}
                 });return;
             }
@@ -291,34 +306,40 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
             // Wider rows preserve scientific terms that cannot fit narrow columns.
             nodes.forEach((n, i) => {
                 const y = top + i * .9;
-                text(n.label, M, y, 2.95, .82, 22, { bold: true }, `relationship.nodes[${i}].label`);
+                text(String(i+1),M,y,.35,.82,18,{color:muted},'relationship.nodeNumber');
+                text(n.label, M+.45, y, 2.5, .82, 22, { bold: true }, `relationship.nodes[${i}].label`);
                 text(n.description, M + 3.12, y, 3.35, .82, 20, {}, `relationship.nodes[${i}].description`);
             });
-            links.forEach((r, i) => text(`${names[r.from]} → ${names[r.to]}: ${r.label}`, 7.7, top + i * .9, 4.9, .82, 22, { color: muted }, `relationship.relationships[${i}]`));
+            // Endpoint names already appear in the numbered node list. Give
+            // relationship text its own box: subtracting a long name prefix
+            // from this box's budget previously clamped meaningful labels to 1.
+            links.forEach((r, i) => {text(`${nodes.findIndex(n=>n.id===r.from)+1} → ${nodes.findIndex(n=>n.id===r.to)+1}`,7.45,top+i*.9,.9,.82,18,{color:muted},'relationship.endpointNumbers');text(r.label,8.5,top+i*.9,4.1,.82,18,{color:muted},`relationship.relationships[${i}].label`);});
             return;
         }
         const w = (CW - .3 * (nodes.length - 1)) / nodes.length;
         nodes.forEach((n, i) => {
             const x = M + i * (w + .3);
-            rule(x, top); text(n.label, x, top + .25, w, 1, 24, { bold: true }, `nodes[${i}].label`);
-            text(n.description, x, top + 1.4, w, 1.35, 20, {}, `nodes[${i}].description`);
+            text(String(i+1),x,top+.25,.35,.4,18,{color:muted},'relationship.nodeNumber');
+            rule(x, top); text(n.label, x+.45, top + .25, w-.45, 1, 24, { bold: true }, `relationship.nodes[${i}].label`);
+            text(n.description, x, top + 1.4, w, 1.35, 20, {}, `relationship.nodes[${i}].description`);
         });
-        links.forEach((r, i) => text(`${names[r.from]} → ${names[r.to]}: ${r.label}`, M, 5.12 + i * .32, CW, .31, 18, { color: muted }, `relationships[${i}]`)); return;
+        links.forEach((r, i) => {text(`${nodes.findIndex(n=>n.id===r.from)+1} → ${nodes.findIndex(n=>n.id===r.to)+1}`,M,5.12+i*.32,.9,.31,18,{color:muted},'relationship.endpointNumbers');text(r.label,M+1.1,5.12+i*.32,CW-1.1,.31,18,{color:muted},`relationship.relationships[${i}].label`);}); return;
     }
     if (content.visualContent) {
         const v = content.visualContent;
         const visual=d.resolvedVisual,diagram=visual?.diagram || v.visual.diagram;
+        const caption=visual?.caption||diagram?.caption,boxes=visualCaptionBoxes(caption,{wide:d.visualCaptionWide,slideNumber:d.slideNumber});
         if(diagram) validateDiagram(diagram);
         // Dry validation accepts a declarative diagram before asset resolution.
         // Unresolved descriptions/search queries never become visible slide text.
         if(!visual && !diagram){text(v.text,M,top+.25,CW-.3,3.9,24,{},'visualContent.text');return;}
-        text(v.text,M,top+.15,5.1,3.95,22,{},'visualContent.text');
-        if(diagram) renderNativeDiagram({slide,diagram,box:{x:6.45,y:top-.1,w:6.15,h:3.9},ink,accent,fontFace:t.bodyFamily,slideNumber:d.slideNumber});
+        text(v.text,M,top+.15,5.1,Math.min(3.95,boxes.bodyBottom-top-.15),22,{},'visualContent.text');
+        if(diagram) renderNativeDiagram({slide,diagram,box:boxes.visual,ink,accent,fontFace:t.bodyFamily,slideNumber:d.slideNumber,validationErrors,onTextLayout});
         else if(visual?.data) {
-            const scale=Math.min(6.15/visual.width,4.1/visual.height),w=visual.width*scale,h=visual.height*scale;
-            slide.addImage({data:visual.data,x:6.45+(6.15-w)/2,y:top+.1+(4.1-h)/2,w,h,altText:visual.altText});
+            const scale=Math.min(6.15/visual.width,boxes.visual.h/visual.height),w=visual.width*scale,h=visual.height*scale;
+            slide.addImage({data:visual.data,x:6.45+(6.15-w)/2,y:boxes.visual.y+(boxes.visual.h-h)/2,w,h,altText:visual.altText});
         }
-        text(visual?.caption || diagram?.caption,6.45,6.35,6.15,.65,17,{color:muted},'visual.caption');return;
+        text(caption,boxes.caption.x,boxes.caption.y,boxes.caption.w,boxes.caption.h,18,{color:muted},'visual.caption');return;
     }
     throw new Error(`Slide ${d.slideNumber}: no canonical renderer for ${type}`);
 
@@ -342,16 +363,18 @@ function renderSlide({ slide, slideData: d, tokens = {}, pptx }) {
     }
 }
 
-export function validateRenderContent(slideData) {
+export function validateRenderContent(slideData,options={}) {
     const mock = { addText() {}, addShape() {}, addChart() {}, addImage() {} };
-    renderProfessionalSlide({ slide: mock, slideData });
+    const validationErrors=[];
+    renderProfessionalSlide({ slide: mock, slideData,...options,validationErrors });
+    if(validationErrors.length)throw Object.assign(validationErrors[0],{validationErrors:validationErrors.map(({field,maxCharacters,repairHint})=>({field,maxCharacters,repairHint}))});
     return true;
 }
 
 // Pre-image stages must validate the same composition that will be rendered.
 // This marker is used only by the no-output dry renderer, never saved as media.
-export function validatePlannedRenderContent(slideData){
+export function validatePlannedRenderContent(slideData,options={}){
     return validateRenderContent(slideData.imageLayoutPlanned&&!slideData.photoAsset
         ?{...slideData,photoAsset:{data:'dry-layout-only'},photoComposition:photoCompositionFor(slideData)}
-        :slideData);
+        :slideData,options);
 }

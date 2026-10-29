@@ -56,7 +56,7 @@ export function validateTextSafety(value, outputType, location = "$", blockType)
     }
 }
 
-export function parseResponse(response, { schema, outputType, strict = true }) {
+export function parseResponse(response, { schema, outputType, strict = true, collectErrors=false }) {
     const reason = response?.candidates?.[0]?.finishReason;
     if (reason === "MAX_TOKENS") throw new AiGenerationError("AI_RESPONSE_TRUNCATED", "AI response reached its output token limit");
     if (response?.promptFeedback?.blockReason || ["SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "RECITATION", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT"].includes(reason)) {
@@ -67,7 +67,10 @@ export function parseResponse(response, { schema, outputType, strict = true }) {
     let value;
     try { value = JSON.parse(response.text.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, "$1")); }
     catch { throw new AiGenerationError("AI_JSON_PARSE_FAILED", "AI returned malformed JSON"); }
-    validateSchema(value, schema, "$", strict);
+    try{validateSchema(value, schema, "$", strict);}catch(error){
+        if(collectErrors){const errors=[];const walk=(v,s,p)=>{if(typeof v==='string'&&s.maxLength!=null&&v.length>s.maxLength)errors.push({field:p,maxCharacters:s.maxLength});if(v&&typeof v==='object'&&!s.anyOf){if(Array.isArray(v)&&s.items)v.forEach((child,i)=>walk(child,s.items,`${p}[${i}]`));else for(const [key,child] of Object.entries(v))if(s.properties?.[key])walk(child,s.properties[key],`${p}.${key}`);}};walk(value,schema,'$');if(error.maxCharacters&&errors.length)error.validationErrors=errors.slice(0,64);}
+        throw error;
+    }
     validateTextSafety(value, outputType);
     return value;
 }

@@ -8,5 +8,5 @@ export function startBackend({config,connect,recover=async()=>{},createApplicati
  const server=createHttpServer(createApplication({isReady:()=>connected&&databaseAvailable()}));
  const listening=new Promise((resolve,reject)=>{server.once('error',reject);server.listen(config.port,config.host,()=>{server.removeListener('error',reject);resolve();});});
  const ready=listening.then(async()=>{logger('listening');await connect();try{await recover();}catch(cause){throw Object.assign(new Error('Job recovery failed',{cause}),{stage:'job-recovery'});}connected=true;logger('ready');}).catch(async error=>{await new Promise(resolve=>server.close(resolve));throw error;});
- return {server,ready};
+ return {server,ready,beginDrain(){connected=false;}};
 }

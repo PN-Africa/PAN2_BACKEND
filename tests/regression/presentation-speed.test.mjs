@@ -21,7 +21,7 @@ test('selective image instructions constrain an over-eager outline before acquis
 });
 test('every-slide and explicit minimum quantities take precedence over selective language',()=>{
  for(const instructions of [`${selective} Every slide must contain an image.`,`${selective} Use at least seven photographs.`])assert.equal(planImageCoverage(deck(),{instructions}).imageCoveragePlan.target,12);
- assert.equal(planImageCoverage(deck(),{instructions:`${selective} No images.`}).imageCoveragePlan.target,1);
+ assert.equal(planImageCoverage(deck(),{instructions:`${selective} No images.`}).imageCoveragePlan.target,0);
  const excluded=planImageCoverage(deck(),{instructions:selective,designPreferences:{noImageSlideNumbers:[1,4,8]}});
  assert.ok(excluded.slides[0].imageRequirement.required);assert.ok(excluded.slides.filter(s=>[4,8].includes(s.slideNumber)).every(s=>!s.imageRequirement));
 });
@@ -45,7 +45,7 @@ test('stock search has a separate deadline and releases capacity for AI fallback
  let aborted=false,generated=0,queryLimit;
  const session=createImageAssetSession({root,policy:{...imagePolicy({}),stockSearchTimeoutMs:25,allowGeneration:true,estimatedUnitCost:.1,maxEstimatedCost:1,retries:0},providers:{search:async brief=>{queryLimit=brief.maxSearchQueries;await new Promise(resolve=>brief.signal.addEventListener('abort',()=>{aborted=true;resolve();},{once:true}));return null;},generate:async()=>{generated++;assert.equal(aborted,true);return null;}}});
  const presentation=deck();await session.resolve(presentation,presentation.slides[0],{family:'editorial',style:'luxury',palette:{}},{});
- assert.equal(queryLimit,3);assert.equal(generated,1);assert.equal(session.budget.report().attempts,1);
+ assert.equal(queryLimit,1);assert.equal(generated,1);assert.equal(session.budget.report().attempts,1);
  assert.equal(imagePolicy({}).stockSearchTimeoutMs,12000);
  assert.equal(imagePolicy({PRESENTATION_STOCK_SEARCH_TIMEOUT_MS:'999999'}).stockSearchTimeoutMs,30000);
 });

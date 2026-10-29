@@ -1,3 +1,4 @@
+import {layoutContentSchema} from '../../Service/ai/presentationLayoutBudget.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {imageSlideSchema,contentBudgetPrompt} from '../../Service/ai/presentationContentBudget.mjs';
@@ -9,12 +10,12 @@ import {photoCompositionFor} from '../../Service/visual/imageArtDirection.mjs';
 
 const schema={type:'object',properties:{visualContent:{type:'object',properties:{text:{type:'string'},visual:{type:'object',properties:{diagram:diagramSchema}}}}}};
 test('photo-diagram constraints reach the provider before any retry and do not mutate shared schemas',()=>{
-    const bounded=imageSlideSchema(schema),v=bounded.properties.visualContent.properties;
+    const bounded=layoutContentSchema(imageSlideSchema(schema),{slideNumber:2,slideType:'text-visual',title:'Mission systems',imageLayoutPlanned:true}),v=bounded.properties.visualContent.properties;
     assert.equal(v.text.maxLength,120);
     assert.equal(v.visual.properties.diagram.properties.nodes.maxItems,4);
-    assert.equal(v.visual.properties.diagram.properties.nodes.items.properties.label.maxLength,18);
+    assert.ok(v.visual.properties.diagram.properties.nodes.items.properties.label.maxLength>=12);assert.ok(v.visual.properties.diagram.properties.nodes.items.properties.label.maxLength<=54);
     assert.match(contentBudgetPrompt(bounded),/visualContent.text: at most 120 characters/);
-    assert.match(contentBudgetPrompt(bounded),/nodes\[\].description: at most 32 characters/);
+    assert.ok(v.visual.properties.diagram.properties.nodes.items.properties.description.maxLength>=33);assert.match(contentBudgetPrompt(bounded),/nodes\[\].description: Layout target: aim for about 40 characters/);
     assert.equal(schema.properties.visualContent.properties.text.maxLength,undefined);
     assert.equal(diagramSchema.properties.nodes.maxItems,8);
 });

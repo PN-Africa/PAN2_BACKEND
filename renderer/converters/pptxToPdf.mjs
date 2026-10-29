@@ -2,8 +2,8 @@ import fs from "fs/promises";
 import path from "path";
 import { pathToFileURL } from "node:url";
 import {
-    execFile
-} from "child_process";
+    trackedExecFile as execFile
+} from "../../Service/renderProcesses.mjs";
 
 import {
     promisify

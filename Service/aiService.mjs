@@ -5,21 +5,27 @@ import { canonicalTitles, reviewAndRepairPresentation, requestedTopics } from '.
 import { visualRequirementSchema, diagramSchema } from '../templates/presentation/visualSchemas.mjs';
 import { resolveSlideCount } from './ai/slideCount.mjs';
 import { numberedSlideRequirements, validateNumberedRequirements } from './ai/presentationIntent.mjs';
-import { randomUUID } from 'node:crypto';
-import {performanceRequestId} from './performance.mjs';
+import { randomUUID,createHash } from 'node:crypto';
+import {performanceRequestId,measureStage} from './performance.mjs';
 import { generateJsonWithRetry } from './ai/generateJsonWithRetry.mjs';
 import { generationConcurrency, generateContentUnits as generateInBatches } from './ai/concurrency.mjs';
 import { buildOutlinePrompt, buildSlidePrompt, validateOutline, outlineProviderSchema } from './ai/presentationPrompts.mjs';
 import { SLIDE_TYPE_CONTENT_MAP, PRESENTATION_COLLECTION_LIMITS } from '../templates/presentation/slideContentSchemas.mjs';
 import { validateSlideContent } from './presentationContentValidator.mjs';
 import { imageSlideSchema, contentBudgetPrompt } from './ai/presentationContentBudget.mjs';
+import {layoutContentSchema} from './ai/presentationLayoutBudget.mjs';
+import {recoverDiagramContent} from './ai/diagramContentRecovery.mjs';
+import {presentationRepairBudget,recoverableSlideFailure} from './ai/presentationRepairBudget.mjs';
+import {fallbackFactLedger,missingFallbackFacts} from './ai/numericFacts.mjs';
 import { AiGenerationError } from './ai/responseValidation.mjs';
 import { validateQuantitativeGrounding } from './ai/sourceGrounding.mjs';
-import { repairPresentationValidation } from './ai/presentationValidation.mjs';
+import { repairPresentationValidation,validateCompletedPresentation } from './ai/presentationValidation.mjs';
 import {wantsTextOnly,planImageCoverage} from './visual/imageArtDirection.mjs';
 import {presentationLayoutService} from './presentationLayoutService.mjs';
 import {Type} from '../templates/shared/schemaTypes.mjs';
 import {getTextClient,textModel} from './ai/textProvider.mjs';
+import {designPlanSchema,designPlanningPrompt} from './design/designSchema.mjs';
+import {validateDesignPlan} from './design/specification.mjs';
 
 import {
     presentationStrategies
@@ -1342,15 +1348,16 @@ if (isPresentation) {
     }
 }
 let plannedSlides;
+if(isPresentation)schema.properties.artifactDesign=designPlanSchema('presentation');
 let generatedContent = isPresentation && options.initialPresentation ? structuredClone(options.initialPresentation) : await run({
     stage: isPresentation ? 'presentation-outline' : 'content-generation',
     schema, outputType, strict: isPresentation,
-    validate: isPresentation ? value => {validateOutline(value, countPolicy, requestedTopics(inputType === 'prompt' ? input : '', context));validateNumberedRequirements(value,numberedSlideRequirements(inputType === 'prompt' ? input : '',context));} : value => {
+    validate: isPresentation ? value => {validateOutline(value, countPolicy, requestedTopics(inputType === 'prompt' ? input : '', context));validateNumberedRequirements(value,numberedSlideRequirements(inputType === 'prompt' ? input : '',context));if(value.artifactDesign)validateDesignPlan(value.artifactDesign,'presentation',value.slides.map(s=>'slide-'+s.slideNumber));} : value => {
         if (value.outputType !== outputType) throw new Error('AI returned incorrect outputType');
     },
     request: {
         model: textModel('presentation-outline'),
-        contents: isPresentation ? buildOutlinePrompt(inputType, input, context, countPolicy) : prompt,
+        contents: isPresentation ? buildOutlinePrompt(inputType, input, context, countPolicy)+'\n'+designPlanningPrompt('presentation') : prompt,
         config: {
             responseMimeType: 'application/json', responseJsonSchema: isPresentation ? outlineProviderSchema(schema) : schema,
             maxOutputTokens: 8192,
@@ -1379,8 +1386,10 @@ if (isPresentation) {
     }
     contentProperties.chart.properties.chartType.enum = ['bar', 'column', 'line', 'pie', 'doughnut', 'area'];
     const previous = [];
+    const repairBudget=presentationRepairBudget({...options,fallbackSlideNumbers:generatedContent.slides.filter(s=>!['title','section-divider'].includes(s.slideType)).map(s=>s.slideNumber)}),recoveryContext=new Map(),failedDrafts=new Map(),approvedDrafts=new Map(),fallbackFacts=new Map();
+    for(const slide of generatedContent.slides)if(slide.contentFallback)repairBudget.claim(slide.slideNumber,'fallback');
     await options.onSlideCheckpoint?.(generatedContent);
-    const generateSlide = async (slide, repairInstruction = '') => {
+    const generateSlide = async (slide, repairInstruction = '',mode='draft') => {
         const contentKey = SLIDE_TYPE_CONTENT_MAP[slide.slideType];
         const imageContext={...context,instructions:[context.instructions,inputType==='prompt'?input:''].filter(Boolean).join('\n')};
         const usesImage=slide.imageLayoutPlanned??!!planImageCoverage({slides:[slide]},imageContext).slides[0].imageRequirement;
@@ -1389,11 +1398,14 @@ if (isPresentation) {
             properties: { [contentKey]: contentProperties[contentKey] },
             required: [contentKey], additionalProperties: false
         };
-        const slideSchema=usesImage?imageSlideSchema(baseSlideSchema):baseSlideSchema;
+        const boundedSchema=usesImage?imageSlideSchema(baseSlideSchema,{recoveryText:slide.contentFallback?.to==='focused-explanation'&&slide.slideType==='focused-explanation'}):baseSlideSchema;
+        const slideSchema=['text-visual','relationship'].includes(slide.slideType)?layoutContentSchema(boundedSchema,{...slide,imageLayoutPlanned:usesImage}):boundedSchema;
         const content=await run({
-            stage: 'slide-content-generation', slideNumber: slide.slideNumber,
+            stage: mode==='fallback'?'slide-fallback-generation':'slide-content-generation', slideNumber: slide.slideNumber,maxAttempts:mode==='draft'?3:2,
             schema: slideSchema, outputType,
+            recoverValidation:mode==='draft'?(content,error)=>recoverDiagramContent(content,error,{slide:{...slide,imageLayoutPlanned:usesImage},client,logger:options.logger,sleep:options.sleep,layoutLogger:options.layoutLogger,claim:()=>repairBudget.claim(slide.slideNumber,'layout')}):undefined,
             validate: content => {
+                failedDrafts.set(slide.slideNumber,structuredClone(content));
                 if (slide.slideType === 'title') content.titleContent = { ...content.titleContent, title: generatedContent.title, subtitle: generatedContent.subtitle || '' };
                 const completedSlide = { ...slide, content };
                 validateSlideContent(completedSlide);
@@ -1402,9 +1414,18 @@ if (isPresentation) {
                 // in a horizontal process or comparison composition.
                 presentationLayoutService({title:generatedContent.title,subtitle:generatedContent.subtitle,slides:[completedSlide]},context);
                 validateQuantitativeGrounding(completedSlide, input);
+                if(mode==='fallback'){
+                    const ledger=fallbackFacts.get(slide.slideNumber)||[],missing=missingFallbackFacts(ledger,content);
+                    if(missing.length){
+                        const maxCharacters=slideSchema.properties.textContent?.properties.body?.maxLength||1200;
+                        const repairHint='Restore these protected source facts in their original context. Correct a wrong number or unit in the rejected draft to the source value below. Preserve other correct content and qualifications; do not invent numerical claims: '+JSON.stringify(missing);
+                        throw new AiGenerationError('AI_SCHEMA_VALIDATION_FAILED','Fallback omitted a numerical value or changed its unit without specific factual review evidence',{field:'textContent.body',validationRule:'FALLBACK_FACT_PRESERVATION',validationErrors:[{field:'textContent.body',maxCharacters,requiredFacts:missing.map(f=>f.value),approvedFacts:ledger.map(f=>f.value),repairHint}],repairHint,factPreservation:{expectedCount:ledger.length,missingCount:missing.length,missing:missing.map(f=>({fields:f.fields,valueHash:createHash('sha256').update(f.value).digest('hex').slice(0,16)}))}});
+                    }
+                }
             },
             request: {
                 model: textModel('slide-content-generation'),
+                targetedFieldRepair:true,
                 contents: buildSlidePrompt(input, context, generatedContent, slide, previous,usesImage) + contentBudgetPrompt(slideSchema) + (repairInstruction ? `\nTargeted quality repair; preserve all correct content and the same canonical structure:\n${repairInstruction}` : ''),
                 config: { responseMimeType: 'application/json', responseJsonSchema: slideSchema,
                     maxOutputTokens: 4096,
@@ -1414,32 +1435,85 @@ if (isPresentation) {
         await options.onSlideReady?.({...slide,content},generatedContent);
         return content;
     };
-    await generateInBatches(generatedContent.slides,
-        generationConcurrency(options.slideConcurrency??process.env.LEDIFY_SLIDE_CONCURRENCY,6),
-        slide=>options.initialPresentation&&slide.content?slide.content:generateSlide(slide),
-        async (content,slide)=>{
-            slide.content=content;
-            previous.push({title:slide.title,content:JSON.stringify(content).slice(0,350)});
-            await options.onSlideCheckpoint?.(generatedContent);
-        });
-    canonicalTitles(generatedContent);
-    const repairApprovedSlide=async(slide,instructions)=>{
-        let repaired={...slide};
-        if(/\b(?:title|subtitle|heading)\b/i.test(instructions.split('Resolve these exact validation failures')[0])){
-            const metadataSchema={type:'object',properties:{title:{type:'string'},subtitle:{type:'string'}},required:['title','subtitle'],additionalProperties:false};
-            const metadata=await run({stage:'slide-metadata-repair',slideNumber:slide.slideNumber,schema:metadataSchema,outputType:'presentation',
-                request:{model:textModel('slide-metadata-repair'),contents:`Correct only this slide title/subtitle for factual accuracy and readability. Title under 80 characters, subtitle under 90; no generic filler or unsupported absolute claims. Preserve topic. Instructions: ${instructions}\nCurrent slide: ${JSON.stringify(slide)}\nSource/context: ${JSON.stringify({input,context})}`,config:{responseMimeType:'application/json',responseJsonSchema:metadataSchema,maxOutputTokens:1024}},
-                validate:value=>{if(!value.title.trim()||value.title.length>80||value.subtitle.length>90)throw new Error('Slide metadata must fit concise readable fields');}});
-            repaired={...slide,...metadata};
-            if(slide.slideType==='title'){generatedContent.title=metadata.title;generatedContent.subtitle=metadata.subtitle;}
+    const fallbackSlide=async(slide,instructions,plan={})=>{
+        const availability=repairBudget.availability(slide.slideNumber,'fallback');
+        if(slide.contentFallback||!availability.allowed){
+            try{(options.qualityLogger||((event)=>console.info('[PRESENTATION_QUALITY]',JSON.stringify(event))))({requestId,stage:'presentation-quality-review',slideNumber:slide.slideNumber,repairStatus:'fallback-unavailable',reason:slide.contentFallback?'SLIDE_ALREADY_CONVERTED':availability.reason,budget:repairBudget.snapshot()});}catch{}
+            return;
         }
-        repaired.content=await generateSlide(repaired,instructions);
+        if(!repairBudget.claim(slide.slideNumber,'fallback'))return;
+        const prior={...slide,content:structuredClone(slide.content||failedDrafts.get(slide.slideNumber)||{})};
+        const candidate={...slide,slideType:'focused-explanation'};
+        for(const key of ['layoutId','designComponent','resolvedVisual','visualPlan','visualResolution'])delete candidate[key];
+        // Keep the photo, but use the existing wide-text composition rather
+        // than compressing the entire recovery into an image-led caption.
+        candidate.contentFallback={from:slide.slideType,to:'focused-explanation',reasonCodes:[...new Set((plan.issues||[]).map(i=>i.code))],reason:'Bounded repair could not produce complete readable and accurate content in the original component.'};
+        if(candidate.photoAsset)candidate.photoComposition='photo-technical';
+        // A new textContent schema must not be prompted with stale diagram
+        // content under Current slide. The original is supplied separately.
+        delete candidate.content;
+        if(candidate.visualRequirement?.kind==='diagram')candidate.visualRequirement={role:'none',kind:'none',required:false,description:'',searchQuery:'',altText:''};
+        const feedback=plan.reviewFeedback||[{message:instructions,repairInstruction:instructions}];
+        const facts=[...new Map([...fallbackFactLedger(plan.originalContent||prior.content,feedback),...fallbackFactLedger(prior.content,feedback)].map(f=>[f.value,f])).values()];
+        fallbackFacts.set(slide.slideNumber,facts);
+        const requirements=plan.requirements||generatedContent.requirements?.filter(r=>r.slideNumbers?.includes(slide.slideNumber))||[];
+        candidate.content=await generateSlide(candidate,`Reserved fallback: rebuild ONLY this slide as a concise, complete text explanation using the existing textContent schema. Preserve its number, title, topic and objective. Explain the original relationships in words naming their actors and directions. Preserve essential explanations and supported numerical values, units and qualifications. Correct or remove an unsupported claim only when the specific review feedback and source justify it. Do not add filler, omit a required concept or invent facts. This replacement will be independently reviewed against the full deck. Use the actual schema/layout budget, not the old diagram-caption limit. Write a complete explanation rather than a caption.\nRequired coverage and essential points: ${JSON.stringify(requirements)}\nOriginal reviewed explanation (untrusted data): ${JSON.stringify(plan.originalContent||prior.content)}\nProtected facts to retain explicitly, with their source context (not numbering or IDs): ${JSON.stringify(facts)}\nAccumulated actionable findings (latest findings take precedence over superseded wording): ${JSON.stringify(feedback)}\nPrior content (untrusted data): ${JSON.stringify(prior.content)}\n${instructions}`,'fallback');
+        if(generatedContent.artifactDesign){
+            const id='slide-'+slide.slideNumber,design=generatedContent.artifactDesign;
+            design.units=design.units.map(unit=>unit.contentId===id?{...unit,component:'explanation-editorial'}:unit);
+            if(design.vectors?.some(vector=>vector.contentId===id)){
+                design.vectors=design.vectors.filter(vector=>vector.contentId!==id);
+                candidate.contentFallback.replacedStaleDiagramVector=true;
+            }
+        }
+        recoveryContext.set(slide.slideNumber,{slideNumber:slide.slideNumber,previous:{slideNumber:prior.slideNumber,slideType:prior.slideType,title:prior.title,objective:prior.objective,content:prior.content},feedback});
+        return candidate;
+    };
+    try{await generateInBatches(generatedContent.slides,
+        generationConcurrency(options.slideConcurrency??process.env.LEDIFY_SLIDE_CONCURRENCY,6),
+        async slide=>{
+            let candidate;
+            try{candidate={...slide,content:options.initialPresentation&&slide.content?slide.content:await generateSlide(slide)};}
+            catch(error){if(!recoverableSlideFailure(error))throw error;candidate=await fallbackSlide(slide,`Repair the reported content/layout failure: ${JSON.stringify({code:error.code,field:error.field,validationErrors:error.validationErrors})}`,{issues:[{code:error.code}]});if(!candidate)throw error;}
+            approvedDrafts.set(slide.slideNumber,candidate);return candidate;
+        },
+        async (candidate,slide)=>{
+            Object.assign(slide,candidate);
+            previous.push({title:slide.title,content:JSON.stringify(slide.content).slice(0,350)});
+            await options.onSlideCheckpoint?.(generatedContent);
+        });}catch(error){for(const slide of generatedContent.slides)if(approvedDrafts.has(slide.slideNumber))Object.assign(slide,approvedDrafts.get(slide.slideNumber));await options.onSlideCheckpoint?.(generatedContent);throw error;}
+    canonicalTitles(generatedContent);
+    const repairApprovedSlide=async(slide,instructions,repairPlan)=>{
+        // Structural preflight must not consume the later semantic-review slot.
+        const repairKind=repairPlan?'targeted':'validation';
+        if(!repairBudget.claim(slide.slideNumber,repairKind))throw new AiGenerationError('SLIDE_REPAIR_BUDGET_EXHAUSTED','The reserved fallback must handle remaining slide repairs',{stage:'presentation-quality-review',slideNumber:slide.slideNumber,repairBudget:repairBudget.snapshot(),repairBudgetReason:repairBudget.availability(slide.slideNumber,repairKind).reason});
+        let repaired={...slide};
+        const metadataOnly=repairPlan?.category==='metadata';
+        if(metadataOnly||!repairPlan&&/\b(?:title|subtitle|heading)\b/i.test(instructions.split('Resolve these exact validation failures')[0])){
+            const targets=metadataOnly?[...new Set(repairPlan.repairTargets||[])].filter(key=>['title','subtitle'].includes(key)):[];
+            const keys=targets.length?targets:['title','subtitle'];
+            const metadataSchema={type:'object',properties:Object.fromEntries(keys.map(key=>[key,{type:'string'}])),required:keys,additionalProperties:false};
+            const metadata=await run({stage:'slide-metadata-repair',slideNumber:slide.slideNumber,schema:metadataSchema,outputType:'presentation',maxAttempts:1,
+                request:{model:textModel('slide-metadata-repair'),contents:`Correct only this slide title/subtitle for factual accuracy and readability. Title under 80 characters, subtitle under 90; no generic filler or unsupported absolute claims. Preserve topic. Instructions: ${instructions}\nCurrent slide: ${JSON.stringify(slide)}\nSource/context: ${JSON.stringify({input,context})}`,config:{responseMimeType:'application/json',responseJsonSchema:metadataSchema,maxOutputTokens:1024}},
+                validate:value=>{if(keys.some(key=>typeof value[key]!=='string'||key==='title'&&!value[key].trim()||value[key].length>(key==='title'?80:90)))throw new Error('Slide metadata must fit concise readable fields');}});
+            repaired={...slide,...metadata};
+            if(slide.slideType==='title'){generatedContent.title=repaired.title;generatedContent.subtitle=repaired.subtitle;}
+        }
+        if(metadataOnly){
+            repaired.content=structuredClone(slide.content);
+            const key=slide.slideType==='title'?'titleContent':slide.slideType==='section-divider'?'sectionContent':null;
+            if(key&&repaired.content?.[key])repaired.content[key]={...repaired.content[key],title:repaired.title,subtitle:repaired.subtitle};
+            return repaired;
+        }
+        repaired.content=await generateSlide(repaired,instructions,'targeted');
         return repaired;
     };
-    await repairPresentationValidation({presentation:generatedContent,source:{inputType,input,context,plannedSlides},requestId,repairSlide:repairApprovedSlide});
-    if (options.qualityReview !== false) generatedContent = await reviewAndRepairPresentation({ presentation: generatedContent,
-        input, inputType, context, client, requestId, options, repairSlide: repairApprovedSlide });
-    await repairPresentationValidation({presentation:generatedContent,source:{inputType,input,context,plannedSlides},requestId,repairSlide:repairApprovedSlide});
+    await repairPresentationValidation({presentation:generatedContent,source:{inputType,input,context,plannedSlides},requestId,repairSlide:repairApprovedSlide,fallbackSlide});
+    if (options.qualityReview !== false||recoveryContext.size||generatedContent.slides.some(slide=>slide.contentFallback)) generatedContent = await reviewAndRepairPresentation({ presentation: generatedContent,
+        input, inputType, context, client, requestId, options:{...options,recoveryContext,repairBudgetSnapshot:()=>repairBudget.snapshot()}, repairSlide: repairApprovedSlide,fallbackSlide });
+    // Never mutate reviewed content in a later unreviewed repair pass.
+    await measureStage('presentation-schema-validation',()=>validateCompletedPresentation(generatedContent,{inputType,input,context,plannedSlides}));
+    if(recoveryContext.size)generatedContent.slideRecovery={slides:generatedContent.slides.filter(s=>s.contentFallback).map(s=>({slideNumber:s.slideNumber,...s.contentFallback})),budget:repairBudget.snapshot()};
     const references = Array.isArray(context.references) ? context.references.filter(ref => typeof ref.title === 'string' && /^https:\/\//.test(ref.url || '')) : [];
     for (const slide of generatedContent.slides) slide.references = references.filter(ref => !ref.slideNumbers?.length || ref.slideNumbers.includes(slide.slideNumber)).map(({ title, url }) => ({ title, url }));
     if (context.includeSpeakerNotes === true) {

@@ -67,7 +67,7 @@ test('gallery plans acquire actual relevant local photographs for distinct items
 test('generated image adapter sends art direction and aspect ratio to the configured model without claiming authentic photos',async()=>{
     const buffer=await fs.readFile('assets/webpage/curated/food.jpg');let request;
     const providers=websiteImageProviders({...approvedImageEnv,WEBPAGE_ALLOW_IMAGE_GENERATION:'true'}, {imageGenerator:async value=>{request=value;return {buffer};}});
-    const asset=await providers[0].acquire({query:'conceptual garden food still life',style:'warm soft light',alt:'Concept food still life',role:'item',aspectRatio:'1:1'});
+    const asset=await providers.find(provider=>provider.kind==='generation').acquire({query:'conceptual garden food still life',style:'warm soft light',alt:'Concept food still life',role:'item',aspectRatio:'1:1'});
     assert.equal(request.aspectRatio,'1:1');assert.match(request.prompt,/warm soft light/);assert.match(request.prompt,/No text, logos/);assert.equal(asset.illustrative,true);assert.match(asset.caption,/AI-generated conceptual/);assert.deepEqual(asset.buffer,buffer);
 });
 

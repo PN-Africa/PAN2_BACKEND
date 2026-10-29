@@ -1,4 +1,5 @@
 // Conservative wrapping estimate, in points/inches. Never truncate or shrink text.
+export const textCharacterBudget=({w,h,fontSize,overhead=0})=>Math.max(10,Math.floor(Math.floor((h+.01)*72/(fontSize*1.25))*(w*72/fontSize)/.6*.85)-overhead);
 export function assertTextFits(text, { w, h, fontSize }, field, slideNumber) {
     if (!text?.trim()) return;
     const capacity = w * 72 / fontSize;
@@ -15,7 +16,7 @@ export function assertTextFits(text, { w, h, fontSize }, field, slideNumber) {
     }
     if (lines * fontSize * 1.25 / 72 > h + .01) fail();
     function fail() {
-        const maxCharacters = Math.max(10, Math.floor(Math.floor(h * 72 / (fontSize * 1.25)) * capacity / .6 * .85));
+        const maxCharacters = textCharacterBudget({w,h,fontSize});
         throw Object.assign(new Error(`Slide ${slideNumber}: ${field} is too dense for readable ${fontSize} pt text. Aim for at most ${maxCharacters} characters, or restructure this field; no content was discarded.`), { code: 'PRESENTATION_CONTENT_TOO_DENSE', slideNumber, field, maxCharacters });
     }
 }

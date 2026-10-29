@@ -1,5 +1,6 @@
 import pptxgen from "pptxgenjs";
 import {validatePresentationBindings} from '../../Service/visual/assetBinding.mjs';
+import {prepareSlideSurfaces} from './backgrounds.mjs';
 
 
 import {
@@ -118,9 +119,10 @@ export const pptxRenderer = async (
     // 7. RENDER EVERY SLIDE
     // =====================================================
 
-    presentation.slides.forEach(
+    const surfaces=await prepareSlideSurfaces(presentation,tokens);
+    surfaces.forEach(
         (
-            slideData,
+            view,
             index
         ) => {
 
@@ -128,11 +130,11 @@ export const pptxRenderer = async (
 
                 pptx,
 
-                slideData,
+                slideData:view.slideData,
 
                 index,
 
-                tokens
+                tokens:view.tokens
 
             });
 
@@ -273,6 +275,13 @@ const renderPresentationSlide = ({
         if(normalizedSlideData.resolvedVisual?.attribution) notes.push(normalizedSlideData.resolvedVisual.attribution,normalizedSlideData.resolvedVisual.originalUrl || '');
         for(const a of normalizedSlideData.photoAssets||[normalizedSlideData.photoAsset].filter(Boolean))notes.push(a.attribution||'',a.originalUrl||'',a.license,a.licenseUrl||'',a.changes||'',a.disclosure||'');
         if (notes.length) slide.addNotes(notes.join('\n'));
+        const credited=[normalizedSlideData.backgroundAsset,normalizedSlideData.resolvedVisual,...(normalizedSlideData.photoAssets||[normalizedSlideData.photoAsset])].filter(a=>a?.attributionRequired);
+        const unique=[...new Map(credited.map(a=>[a.assetId||a.originalUrl||a.attribution,a])).values()];
+        if(unique.length){
+            // License credits must survive PDF/PNG exports, where speaker
+            // notes are unavailable. They are not technical image labels.
+            slide.addText(unique.map((a,i)=>({text:(i?'  |  ':'')+(a.creator?`${a.creator} / ${a.source||''} / ${a.license||''} (cropped/resized)`:a.attribution||'Source credits in notes'),options:{...(/^https:\/\//.test(a.originalUrl||a.licenseUrl||'')?{hyperlink:{url:a.originalUrl||a.licenseUrl}}:{})}})),{x:.72,y:7.23,w:11.89,h:.21,fontSize:9,fontFace:'Arial',color:'FFFFFF',fill:{color:'172536'},margin:0,breakLine:false,_field:'source.credits'});
+        }
 
     } catch (error) {
 

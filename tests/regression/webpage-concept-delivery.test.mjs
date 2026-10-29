@@ -39,10 +39,10 @@ test('concept requests skip live stock and curated fallbacks; configured generat
  const unavailable=await acquireWebsiteImages(page,{}, {providers:[stock],optimization:{cacheRoot:root},logger:()=>{},relevanceLogger:()=>{}});
  assert.equal(stockCalls,0);assert.equal(unavailable.page.visualAssets.hero,undefined);assert.equal(unavailable.page.imageValidation.status,'incomplete');
  const buffer=await fs.readFile('assets/webpage/curated/space-orbit.jpg');
- const generated=await acquireWebsiteImages(page,{}, {providers:[stock,{id:'gemini-image',acquire:async()=>{generatedCalls++;return {buffer,source:'Google Gemini',creator:'AI generated',license:'Fixture generation terms',alt:'Futuristic city concept'};}}],optimization:{cacheRoot:root},logger:()=>{},relevanceLogger:()=>{}});
- assert.equal(stockCalls,0);assert.equal(generatedCalls,1);assert.equal(generated.page.visualAssets.hero.source,'Google Gemini');assert.equal(generated.page.imageValidation.status,'passed');
+ const generated=await acquireWebsiteImages(page,{}, {policy:{estimatedUnitCost:.06,maxEstimatedCost:.06},providers:[stock,{id:'generated-image',kind:'generation',acquire:async()=>{generatedCalls++;return {buffer,source:'Mock dedicated provider',sourceType:'ai-generated',creator:'AI generated',license:'Fixture generation terms',alt:'Futuristic city concept'};}}],optimization:{cacheRoot:root},logger:()=>{},relevanceLogger:()=>{}});
+ assert.equal(stockCalls,0);assert.equal(generatedCalls,1);assert.equal(generated.page.visualAssets.hero.source,'Mock dedicated provider');assert.equal(generated.page.imageValidation.status,'passed');
 });
-test('website missing required concept imagery returns available files with HTTP 201 warnings, while strict mode retains HTTP 422',async t=>{
+test('website missing required concept imagery returns recoverable draft files with HTTP 422',async t=>{
  const root=await temporary(t),model={create:async value=>({...value,_id:'fixture',save:async()=>{}})};
  const app=createApp({model,webpageRoot:root,generator:(kind,input,type,context)=>generateService(kind,input,type,context,{completedContent:{generatedContent:content()},webpageAssets:{providers:[],curated:false,external:false,policy:{failureMode:context.tone==='strict'?'strict':undefined}},artifacts:{root}})});
  const server=app.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve));});
@@ -50,7 +50,7 @@ test('website missing required concept imagery returns available files with HTTP
  for(const strict of [false,true]){
   const response=await fetch(origin+'/api/generate/textPrompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({textPrompt:'Create a website with images and a futuristic city hero.',outputType:'webpage',context:{tone:strict?'strict':'educational'}})});
   const body=await response.json(),result=body.data.result;
-  assert.equal(response.status,strict?422:201);assert.equal(result.status,strict?'incomplete':'partial_success');
+  assert.equal(response.status,422);assert.equal(result.status,'incomplete');
   assert.equal(result.imageValidation.status,'incomplete');assert.ok(result.warnings.some(w=>w.code==='IMAGE_REQUIREMENTS_UNMET'));assert.ok(result.artifacts.previewUrl);assert.ok(result.artifacts.downloadUrl);
   const zip=await fetch(origin+result.artifacts.downloadUrl);assert.equal(zip.status,200);assert.ok((await zip.arrayBuffer()).byteLength>100);
  }

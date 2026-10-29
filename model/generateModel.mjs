@@ -25,6 +25,7 @@ const generationSchema = new mongoose.Schema(
         },
 
         artifacts: { type: mongoose.Schema.Types.Mixed },
+        outcome: { type: mongoose.Schema.Types.Mixed },
 
         generatedContent: {
             type: mongoose.Schema.Types.Mixed

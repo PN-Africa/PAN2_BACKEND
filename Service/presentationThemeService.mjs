@@ -6,6 +6,8 @@ import {
 import {
     getPresentationDesignTokens
 } from "../templates/presentation/presentationDesignTokens.mjs";
+import {topicColorPalette} from './design/colorSystem.mjs';
+import {wantsTextOnly} from './visual/imageArtDirection.mjs';
 
 
 // =========================================================
@@ -143,11 +145,14 @@ export const presentationThemeService = (
     // 7. RETURN PRESENTATION WITH DESIGN INFORMATION
     // =====================================================
 
+    const automaticPalette=!requestedTheme&&!requestedVariant&&!requestedAppearance&&!generatedContent.artifactDesign?topicColorPalette(generatedContent.inferredContext?.topic||generatedContent.title):null;
     return {
 
         ...generatedContent,
 
         design: {
+            uniformBackground:designPreferences.uniformBackground===true||/\b(?:all|every)\s+slides?[^.!?\n]{0,35}\b(?:plain white|same background|uniform background)\b/i.test(context.instructions||''),
+            noRasterBackground:wantsTextOnly(context),
 
             themeId:
                 designTokens.themeId,
@@ -156,7 +161,7 @@ export const presentationThemeService = (
                 designTokens.variantId,
 
             tokens:
-                designTokens
+                automaticPalette?{...designTokens,colors:{...designTokens.colors,...automaticPalette.colors}}:designTokens
 
         }
 

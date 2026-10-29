@@ -1,5 +1,6 @@
 import {validatePresentationContent} from '../presentationContentValidator.mjs';
 import {AiGenerationError} from './responseValidation.mjs';
+import {recoverableSlideFailure} from './presentationRepairBudget.mjs';
 import {canonicalTitles} from './presentationQuality.mjs';
 import {presentationLayoutService} from '../presentationLayoutService.mjs';
 import {generateIndependent,generationConcurrency} from './concurrency.mjs';
@@ -15,11 +16,11 @@ export function validateCompletedPresentation(presentation,source) {
     return true;
 }
 
-export async function repairPresentationValidation({presentation,source,requestId,repairSlide,concurrency=2}) {
+export async function repairPresentationValidation({presentation,source,requestId,repairSlide,fallbackSlide,concurrency=2}) {
     for(let round=0;round<=2;round++){
         try{await measureStage('presentation-schema-validation',()=>validateCompletedPresentation(presentation,source));return;}
         catch(error){
-            const issues=error.validationErrors||[error.message];
+            const issues=(error.validationErrors||[error.message]).map(issue=>typeof issue==='string'?issue:`Slide ${error.slideNumber||''}: ${issue.field||'content'} ${Number.isInteger(issue.maxCharacters)?'maximum '+issue.maxCharacters+' characters. ':''}${issue.repairHint||''}`);
             const targets=new Map();
             for(const issue of issues){
                 const numbers=[...issue.matchAll(/\bSlide (\d+)/g)].map(match=>Number(match[1]));
@@ -44,11 +45,12 @@ export async function repairPresentationValidation({presentation,source,requestI
                     `Other slides (avoid duplicating their title or body): ${JSON.stringify(snapshot.filter(item=>item.slideNumber!==number).map(({slideNumber,title,content})=>({slideNumber,title,content})))}`];
                 if(requirements.some(issue=>/drifted away/i.test(issue))) instructions.push('Make the connection to the presentation topic explicit in the visible body, and explain the approved subtopic using its specific terminology.');
                 if(requirements.some(issue=>/Presentation averages/i.test(issue))) instructions.push('Reduce visible text to fewer than 100 words while preserving essential facts.');
-                const repaired=await repairSlide(structuredClone(slide),instructions.join('\n'));
+                let repaired;
+                try{repaired=await repairSlide(structuredClone(slide),instructions.join('\n'));}catch(failure){if(!fallbackSlide||!recoverableSlideFailure(failure))throw failure;repaired=await fallbackSlide(structuredClone(slide),instructions.join('\n'));if(!repaired)throw failure;}
                 // Callbacks may return either complete slide metadata or canonical content.
                 const candidate=repaired?.content?{...slide,...repaired}:{...slide,content:repaired};
                 candidate.slideNumber=slide.slideNumber;
-                candidate.slideType=slide.slideType;
+                candidate.slideType=candidate.contentFallback?.to==='focused-explanation'?'focused-explanation':slide.slideType;
                 presentationLayoutService({title:presentation.title,subtitle:presentation.subtitle,slides:[candidate]},source?.context||{});
                 return {slide,candidate};
             },value=>{approved.push(value);});

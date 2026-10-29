@@ -1,5 +1,6 @@
 import {metadataSubjectEvidence} from './subjectEvidence.mjs';
 import {createHash} from 'node:crypto';
+import {sceneEvidence,geographicAnchors} from './sceneEvidence.mjs';
 // A matching request is not evidence about the returned image's contents.
 const domains={
     automotive:/\b(?:automotive|automobiles?|cars?|supercars?|hypercars?|vehicles?|sedans?|SUVs?|motorsport|powertrains?|cockpits?|headlamps?|headlights?|alloy wheels?)\b/i,
@@ -51,6 +52,8 @@ export function evaluateImageRelevance(record,target={}){
     // outside this legacy taxonomy. The general evidence gate handles it.
     const desired=medicalScene?['medicalTechnology']:placementDomains.length?placementDomains:primaryDomains.length?primaryDomains:target.primaryTopic?[]:queryDomains;
     const text=candidateImageText(record),actual=imageTopicDomains(text);
+    const scene=sceneEvidence(text,query,target);
+    if(!scene.accepted)return {...scene,applicable:true,method:'independent-scene-metadata',limits:'Metadata evidence cannot certify actual pixels.'};
     const localWords=local.toLowerCase().match(/[\p{L}]{4,}/gu)||[];
     const namedSubjectMatch=!localDomains.length&&!primaryDomains.length&&localWords.length>0&&localWords.every(word=>text.toLowerCase().includes(word));
     const domainMatch=!desired.length||desired.some(name=>actual.includes(name))||namedSubjectMatch;
@@ -68,6 +71,8 @@ export function evaluateImageRelevance(record,target={}){
         method:'independent-metadata',limits:'Metadata relevance is not a visual or factual certification.'};
 }
 export function relevantSearchQuery(target={}){
+    const explicit=target.query||target.searchQuery||'';
+    if(geographicAnchors(explicit,target).length)return explicit.slice(0,160);
     if(target.identityLabel)return (String(target.identityLabel).replace(/[^\p{L}\p{N}\s-]/gu,' ').trim()+(imageTopicDomains(target.topic).includes('automotive')?' car exterior':'')).slice(0,160);
     const local=target.sectionTopic||target.slideTitle||'';
     const topic=target.topic||target.subject||target.query||target.searchQuery||'';

@@ -1,22 +1,20 @@
 // Visible copy must be constrained before generation, not discovered one field
 // at a time by the renderer after a paid request. Clone per slide: the original
 // schema is shared by parallel generation calls.
-export function imageSlideSchema(schema) {
+import {textCharacterBudget} from '../../renderer/presentation/contentFit.mjs';
+import {PHOTO_TECHNICAL_TEXT_BOX} from '../../renderer/presentation/photoCompositions.mjs';
+export function imageSlideSchema(schema,{recoveryText=false}={}) {
     // Schemas reuse the same string-node object for unrelated fields. JSON
     // cloning deliberately breaks those aliases as well as copying the schema.
     const result=JSON.parse(JSON.stringify(schema));
     const limits={
         'titleContent.supportingText':45,
-        'textContent.heading':38,'textContent.body':280,
+        'textContent.heading':38,'textContent.body':recoveryText?textCharacterBudget(PHOTO_TECHNICAL_TEXT_BOX):280,
         'visualContent.text':120,
         'visualContent.visual.diagram.nodes':4,
-        'visualContent.visual.diagram.nodes.label':18,
-        'visualContent.visual.diagram.nodes.description':32,
         'visualContent.visual.diagram.edges':4,
-        'visualContent.visual.diagram.edges.label':14,
-        'relationship.nodes':4,'relationship.nodes.label':18,
-        'relationship.nodes.description':32,'relationship.relationships':4,
-        'relationship.relationships.label':14,
+        'relationship.nodes':4,
+        'relationship.relationships':4,
         'comparison.items':3,'comparison.items.label':28,
         'comparison.items.points':3,'comparison.items.points.*':38,
         'items':4,'items.title':28,'items.description':50,
@@ -45,6 +43,7 @@ export function contentBudgetPrompt(schema){
     const limits=[];
     function visit(node,path){
         if(node.maxLength!==undefined)limits.push(`${path}: at most ${node.maxLength} characters`);
+        if(node.description?.startsWith('Layout target:'))limits.push(`${path}: ${node.description}`);
         if(node.maxItems!==undefined)limits.push(`${path}: at most ${node.maxItems} items`);
         for(const [key,child] of Object.entries(node.properties||{}))visit(child,path?`${path}.${key}`:key);
         if(node.items)visit(node.items,`${path}[]`);

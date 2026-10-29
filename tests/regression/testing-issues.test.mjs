@@ -59,13 +59,12 @@ test('process prose is checked against final layout candidates before generation
 test('resumed content cannot silently return eight slides for an explicit ten-slide request',async()=>{
  await assert.rejects(generateService('prompt','Create exactly 10 slides about transport.','presentation',{}, {completedContent:{generatedContent:{slides:Array.from({length:8},()=>({}))}},prefetchImages:false}),error=>error.code==='AI_SCHEMA_VALIDATION_FAILED'&&error.expectedSlides===10&&error.actualSlides===8);
 });
-test('remaining editorial concerns produce review warnings while factual failures still block export',async()=>{
+test('unresolved clarity, factual and coverage errors remain blocking after bounded repairs',async()=>{
  const presentation={title:'Transport',slides:[{slideNumber:1,title:'Transport choices',slideType:'focused-explanation',content:{textContent:{body:'Cities can compare walking and public transport.'}}}]};
  for(const code of ['CLARITY','FACTUAL','COVERAGE']){
   const client={models:{generateContent:async()=>({text:JSON.stringify({coverage:[],issues:[{slideNumber:1,severity:'error',code,message:'Review the explanation.',repairInstruction:'Explain the comparison.'}]}),candidates:[{finishReason:'STOP'}]})}};
   const work=reviewAndRepairPresentation({presentation:structuredClone(presentation),input:'Explain transport choices.',inputType:'prompt',context:{},client,options:{logger:()=>{}},repairSlide:async slide=>slide.content});
-  if(code==='CLARITY'){const result=await work;assert.equal(result.quality.status,'requires_review');assert.ok(result.warnings.some(w=>w.code==='PRESENTATION_REVIEW_REQUIRED'));}
-  else await assert.rejects(work,{code:'PRESENTATION_QUALITY_FAILED'});
+  await assert.rejects(work,{code:'PRESENTATION_QUALITY_FAILED'});
  }
 });
 test('educational prompts mentioning excluded business claims do not become corporate facility claims',()=>{

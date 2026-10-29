@@ -25,11 +25,13 @@ export function presentationLayoutService(generatedContent, context = {}) {
         if(slide.slideType==='relationship' && slides.length>=2 && slides.slice(-2).every(s=>s.layoutId==='process-horizontal')) preferred='relationship-chain-vertical';
         const repeat=slides.length>=2 && slides.at(-1).layoutId===preferred && slides.at(-2).layoutId===preferred;
         const intentional=slide.slideType==='comparison' && context.designPreferences?.consistentComparisonSeries===true;
-        const candidates=[preferred,...available.filter(id=>id!==preferred)];
-        if(repeat&&!intentional&&available.length>1) candidates.push(candidates.shift());
+        const recommendation=slide.designComponent;
+        const candidates=[...(available.includes(recommendation)?[recommendation]:[]),preferred,...available.filter(id=>id!==preferred&&id!==recommendation)];
+        if(repeat&&!intentional&&!recommendation&&available.length>1) candidates.push(candidates.shift());
         let error;
-        for(const layoutId of candidates){try{validatePlannedRenderContent({...slide,layoutId});slide.layoutId=layoutId;break;}catch(e){error=e;}}
+        for(const layoutId of candidates){try{validatePlannedRenderContent({...slide,layoutId});slide.layoutId=layoutId;break;}catch(e){if(!error||(e.validationErrors?.length||1)<(error.validationErrors?.length||1))error=e;}}
         if(!slide.layoutId) throw error;
+        if(recommendation&&slide.layoutId!==recommendation)warnings.push({code:'DESIGN_COMPONENT_FALLBACK',stage:'layout-compilation',slideNumber:slide.slideNumber,requestedComponent:recommendation,selectedComponent:slide.layoutId,reason:available.includes(recommendation)?'Content does not fit the requested component at readable typography.':'The requested component does not support this semantic content.',message:'A compatible layout preserved the complete content.'});
         if(repeat&&!intentional&&slide.layoutId===preferred) warnings.push({code:'LAYOUT_REPETITION',stage:'layout-selection',slideNumber:slide.slideNumber,message:'This composition repeats because alternate compatible layouts could not preserve readable content.'});
         slides.push(slide);
     }

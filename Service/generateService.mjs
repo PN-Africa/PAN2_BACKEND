@@ -11,11 +11,18 @@ import { aiService } from "./aiService.mjs";
 import { resolvePresentationVisuals } from './visual/presentationVisuals.mjs';
 import { createDiagramPlanner } from './visual/diagramPlanner.mjs';
 import { documentArtifactService } from './document/documentArtifactService.mjs';
-import {measureStage,profileGeneration,performanceReport} from './performance.mjs';
+import {measureStage,profileGeneration,performanceReport,checkGenerationDeadline} from './performance.mjs';
 import {presentationPrefetch} from './visual/presentationPrefetch.mjs';
 import {resolveSlideCount} from './ai/slideCount.mjs';
 import {withGenerationCapacity} from './generationCapacity.mjs';
 import {webpageImageManifest} from './visual/assetBinding.mjs';
+import {normalizeGenerationInput} from './input/generationInput.mjs';
+import {createSpecification,compileDesign,applyPresentationDesign,setAssetRequirements} from './design/specification.mjs';
+import {planWebsiteImages} from './webpage/imageStrategy.mjs';
+import {renderInspectRepair,inspectPresentationPreview,repairPresentationComponents,discardRejectedPreview,presentationDesignTrace} from './design/quality.mjs';
+import {resolveDesignVectors} from './design/safeSvg.mjs';
+import {generationOutcome} from './generationOutcome.mjs';
+import {createLayoutTextRepair} from './visual/layoutRecovery.mjs';
 
 import {
     presentationLayoutService
@@ -46,14 +53,21 @@ const generate = async (
     options = {}
 ) => {
     const started=performance.now(),timings={};
-    const finish=result=>({...result,timings:{...timings,totalMs:Math.round(performance.now()-started)},performance:performanceReport()});
+    let specification,designQuality;
+    const finish=result=>{
+        checkGenerationDeadline();
+        const sourceWarnings=Array.isArray(context.sourceWarnings)?context.sourceWarnings:[];
+        const status=sourceWarnings.length&&result.status==='completed'?'completed_with_warnings':result.status;
+        return {...result,status,...(sourceWarnings.length?{warnings:[...(result.warnings||[]),...sourceWarnings]}:{}),outcome:generationOutcome({...result,status}),...(specification?{engineVersion:'2.0',designSpecification:specification,...(designQuality?{designQuality}:{})}:{}),timings:{...timings,totalMs:Math.round(performance.now()-started)},performance:performanceReport()};
+    };
+    const normalizedInput=await measureStage('input-normalization',()=>normalizeGenerationInput(inputType,input,outputType,context,performanceReport()?.requestId));
 
     // =====================================================
     // 1. GENERATE STRUCTURED CONTENT WITH AI
     // =====================================================
 
     const early=outputType==='presentation'&&options.prefetchImages!==false?presentationPrefetch({inputType,input,context,options:options.visuals}):null;
-    const aiOptions={...options.ai,
+    const aiOptions={...options.ai,normalizedInput,
         onSlideReady:async(slide,deck)=>{
             await options.ai?.onSlideReady?.(slide,deck);
             // A locally validated later slide can start its image while an
@@ -70,6 +84,11 @@ const generate = async (
     ));}catch(error){early?.cancel();throw error;}
     try{
     aiResult=structuredClone(aiResult);
+    if(outputType==='presentation'){const requested=resolveSlideCount(inputType==='prompt'?input:'',context);const actual=aiResult.generatedContent?.slides?.length;if(requested.source!=='default'&&actual!==requested.min)throw Object.assign(new Error(`Expected ${requested.min} slides; received ${actual}.`),{code:'AI_SCHEMA_VALIDATION_FAILED',stage:'presentation-validation',field:'slides',expectedSlides:requested.min,actualSlides:actual});}
+    if(process.env.LEDIFY_DESIGN_ENGINE!=='legacy'){
+        specification=await measureStage('design-specification',()=>createSpecification(aiResult.generatedContent,outputType,{requestId:normalizedInput.requestId,context:{...context,instructions:normalizedInput.instructions}}));
+        aiResult.generatedContent=await measureStage('layout-compilation',()=>compileDesign(specification,aiResult.generatedContent));
+    }else{delete aiResult.generatedContent.artifactDesign;for(const slide of aiResult.generatedContent.slides||[])delete slide.designComponent;}
     await options.onContentReady?.(aiResult);
     timings.aiMs=Math.round(performance.now()-started);
     const artifactStarted=performance.now();
@@ -88,8 +107,11 @@ const generate = async (
         if(context.designPreferences?.heroComposition)normalized.designSpec.heroComposition=context.designPreferences.heroComposition;
         const designed=await measureStage('website-design',()=>planWebpageDesign(normalized,context));
         designed.websiteBrief=compileWebsiteBrief(designed,input,context);
+        if(specification)await measureStage('asset-planning',()=>setAssetRequirements(specification,planWebsiteImages(designed,context).map(target=>({contentId:target.sectionId||'@artifact',kind:target.visualIntent==='concept'?'illustration':'photo',required:target.required===true,subject:target.query}))));
         const resolved = await measureStage('website-images',()=>acquireWebsiteImages(webpageThemeService(designed, context), context, options.webpageAssets));
         const page = resolved.page;
+        const source=context.sourceUnderstanding?.source;
+        if(source?.retrievedSuccessfully&&/^https?:\/\//.test(source.canonicalUrl||''))page.sourceReferences=[{title:source.title||'Original source',url:source.canonicalUrl}];
         const rendered=await measureStage('website-html-css-js',()=>webpageRenderer(page,resolved.assets));
         const inspected = await measureStage('website-validation',()=>inspectWebsite(rendered,options.webpageQuality));
         page.quality={...page.quality,validation:inspected.report};
@@ -99,7 +121,8 @@ const generate = async (
         timings.renderMs=Math.round(performance.now()-artifactStarted);
         const needsReview=page.contentSpecification?.missingInformation.length||resolved.warnings.length||inspected.warnings.length||inspected.report.browser!=='passed';
         const imagesUnmet=page.imageValidation?.status==='incomplete';
-        const strictImages=(options.webpageAssets?.policy?.failureMode||process.env.WEBPAGE_IMAGE_FAILURE_MODE)==='strict';
+        const strictImages=!!specification||(options.webpageAssets?.policy?.failureMode||process.env.WEBPAGE_IMAGE_FAILURE_MODE)==='strict';
+        designQuality={status:imagesUnmet||inspected.report.browser==='failed'?'incomplete':inspected.report.browser==='passed'?'passed':'requires-review',inspection:inspected.report};
         return finish({ ...aiResult, generatedContent: page,imageValidation:page.imageValidation, status: imagesUnmet&&strictImages?'incomplete':imagesUnmet&&artifacts.status==='completed'?'partial_success':artifacts.status==='completed'&&needsReview?'completed_with_warnings':artifacts.status, artifacts,
             warnings: [...(page.warnings || []),...(page.limitations || []).map(message => ({ code: 'STATIC_SCOPE_LIMITATION', message })), ...resolved.warnings, ...inspected.warnings, ...artifacts.warnings,
                 ...(imagesUnmet?[{code:'IMAGE_REQUIREMENTS_UNMET',stage:'image-validation',message:'Website files are available, but some requested images could not be acquired. Review the missing placements before publishing.',missingTargets:page.imageValidation.requiredMissing||[]}]:[])] });
@@ -107,6 +130,7 @@ const generate = async (
     if (outputType === 'document') {
         const document=aiResult.generatedContent;
         const artifacts=await documentArtifactService(document,{instructions:inputType==='prompt'?input:context.instructions,...context},options.document);
+        designQuality={status:artifacts.status==='incomplete'?'incomplete':'validated',inspection:{word:artifacts.validation,pdf:artifacts.pdf.status,visualReview:'not-run',pagination:'Word renderer; HTML preview is not page-accurate'}};
         timings.renderMs=Math.round(performance.now()-artifactStarted);
         return finish({...aiResult,status:artifacts.status,...(artifacts.pdf.status==='failed'?{exportValidation:{status:'incomplete',errorCode:'DOCUMENT_PDF_UNAVAILABLE'}}:{}),documentId:artifacts.id,previewUrl:artifacts.previewUrl,downloadUrl:artifacts.downloadUrl,artifacts,warnings:[...(document.warnings||[]),...(artifacts.pdf.status==='failed'?[{code:'DOCUMENT_PDF_UNAVAILABLE',stage:'document-export',message:'PDF export failed. Word and HTML preview remain available; retry the PDF link.'}]:[])]});
     }
@@ -206,6 +230,7 @@ const generate = async (
             presentationRendererService(
                 presentationWithTheme
             );
+        if(specification)rendererReadyPresentation=applyPresentationDesign(rendererReadyPresentation,specification,context);
 
 
         // =================================================
@@ -226,23 +251,31 @@ const generate = async (
 
         const visualStarted=performance.now();
         timings.layoutMs=Math.round(visualStarted-artifactStarted);
-        const visualContext={...resolvedContext,instructions:[context.instructions,inputType==='prompt'?input:''].filter(Boolean).join('\n')};
+        const visualContext={...resolvedContext,instructions:[context.instructions,inputType==='prompt'?input:''].filter(Boolean).join('\n'),imageRequirementInstructions:[context.instructions,...(context.keyInstructions||[]),inputType==='prompt'?input:''].filter(Boolean).join('\n')};
+        const vectorAssets=specification?await measureStage('svg-assets',()=>resolveDesignVectors(specification)):[];
         rendererReadyPresentation = await measureStage('presentation-images',()=>resolvePresentationVisuals(rendererReadyPresentation, visualContext,
-            {diagramPlanner:createDiagramPlanner(options.ai),...options.visuals,prefetch:early}));
+            {diagramPlanner:createDiagramPlanner(options.ai),repairText:createLayoutTextRepair(options.ai),...options.visuals,...(vectorAssets.length?{userAssets:[...(options.visuals?.userAssets||[]),...vectorAssets]}:{}),prefetch:early}));
+        if(specification)setAssetRequirements(specification,specification.assets.map(asset=>{
+            const slide=rendererReadyPresentation.slides.find(s=>'slide-'+s.slideNumber===asset.contentId);
+            return ['photo','illustration'].includes(asset.kind)&&slide?.imageRequirement?{...asset,required:slide.imageRequirement.required}:asset;
+        }));
         timings.visualsMs=Math.round(performance.now()-visualStarted);
         const renderStarted=performance.now();
 
         const incomplete=rendererReadyPresentation.imageValidation?.status==='incomplete';
-        const preview =
-            await previewRenderer(
-                incomplete?{...rendererReadyPresentation,imageCoveragePlan:{...rendererReadyPresentation.imageCoveragePlan,required:false}}:rendererReadyPresentation, options.preview
-            );
+        const renderInput=incomplete?{...rendererReadyPresentation,imageCoveragePlan:{...rendererReadyPresentation.imageCoveragePlan,required:false}}:rendererReadyPresentation;
+        let preview;
+        if(specification){const checked=await renderInspectRepair({input:renderInput,render:value=>previewRenderer(value,options.preview),inspect:(result,value)=>inspectPresentationPreview(result,value,options.visualReview),repair:repairPresentationComponents,discard:value=>discardRejectedPreview(value,options.preview?.outputDirectory)});preview=checked.artifact;rendererReadyPresentation=checked.input;designQuality={...checked.quality,compilation:presentationDesignTrace(checked.input,specification)};}
+        else preview=await previewRenderer(renderInput,options.preview);
         const imageValidation=rendererReadyPresentation.imageCoveragePlan.required&&(preview.stages.pdf!=='completed'||preview.stages.png!=='completed')?{...rendererReadyPresentation.imageValidation,status:'incomplete',rendering:'unverified'}:rendererReadyPresentation.imageValidation;
         // Image completeness describes quality, not whether usable artifacts can
         // be delivered. Best-effort requests retain that evidence as warnings.
         const imagesUnmet=imageValidation?.status==='incomplete';
         const strictImages=rendererReadyPresentation.imageCoveragePlan.enforcement==='strict';
         const warnings=[...rendererReadyPresentation.warnings,...preview.warnings];
+        const optionalMissing=rendererReadyPresentation.slides.filter(s=>s.imageRequirement&&!s.imageRequirement.required&&!s.photoAsset).map(s=>s.slideNumber);
+        const recoveredAiAttempts=performanceReport()?.ai?.failedCalls||0;
+        const recovered=!imagesUnmet&&rendererReadyPresentation.visualValidation?.status!=='incomplete'&&designQuality?.status!=='incomplete'&&preview.status==='completed'&&(optionalMissing.length>0||recoveredAiAttempts>0||rendererReadyPresentation.slides.some(s=>s.layoutRecovery?.status==='repaired'||s.layoutRecovery?.status==='adapted'));
         if(imagesUnmet&&!warnings.some(w=>w.code==='IMAGE_REQUIREMENTS_UNMET'))warnings.push({
             code:'IMAGE_REQUIREMENTS_UNMET',stage:'image-validation',
             message:'Presentation delivered with image quality warnings. Review missing images and preview availability before use.',
@@ -259,8 +292,10 @@ const generate = async (
         return finish({
 
             ...aiResult,
-            status: imagesUnmet?'incomplete':preview.status === 'completed' && warnings.length ? 'completed_with_warnings' : preview.status,
+            status: imagesUnmet||rendererReadyPresentation.visualValidation?.status==='incomplete'||designQuality?.status==='incomplete'?'incomplete':recovered?'completed':preview.status === 'completed' && warnings.length ? 'completed_with_warnings' : preview.status,
+            ...(recovered?{recovery:{status:'completed_with_recovery',optionalImageSlides:optionalMissing,recoveredAiAttempts,layoutRepairedSlides:rendererReadyPresentation.slides.filter(s=>s.layoutRecovery).map(s=>s.slideNumber)}}:{}),
             imageValidation,
+            visualValidation:rendererReadyPresentation.visualValidation,
             warnings,
 
             resolvedContext,
@@ -290,4 +325,4 @@ const generate = async (
     }finally{early?.cancel();}
 
 };
-export const generateService=(...args)=>profileGeneration(()=>withGenerationCapacity(()=>generate(...args)),args[4]?.performance);
+export const generateService=(...args)=>profileGeneration(()=>withGenerationCapacity(()=>generate(...args)),{outputType:args[2],...args[4]?.performance});

@@ -8,8 +8,8 @@ export function creativeStyles(theme){
 .hero.headline-long h1{font-size:clamp(2.2rem,3.7vw,3.4rem);overflow-wrap:normal;hyphens:auto}
 .background-brand{background:var(--primary);--text:var(--onPrimary);--muted:var(--onPrimary);--surface:var(--primary);color:var(--text)}
 .background-accent{background:var(--accent);--text:var(--onAccent);--muted:var(--onAccent);--surface:var(--accent);color:var(--text)}
-.background-dark{background:#10181f;--text:#f5f9fc;--muted:#d5e0e9;--surface:#1a2833;--primary:#d5e0e9;--onPrimary:#10181f;color:var(--text)}
-.background-gradient{background:linear-gradient(120deg,var(--background),color-mix(in srgb,var(--accent) 8%,var(--background)),var(--background))}
+.background-dark{background:var(--darkSurface);color:var(--text)}
+.background-gradient{background:linear-gradient(120deg,var(--gradientStart),var(--gradientEnd));color:var(--text)}
 .background-texture{background-color:var(--background);background-image:repeating-linear-gradient(120deg,transparent 0px,transparent 8px,color-mix(in srgb,var(--text) 3%,transparent) 9px,transparent 10px)}
 .background-split{background:linear-gradient(90deg,var(--background) 50%,var(--surface) 50%)}
 .background-brand .project,.background-accent .project{border-color:currentColor}

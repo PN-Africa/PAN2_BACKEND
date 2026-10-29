@@ -1,0 +1,28 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import JSZip from 'jszip';
+import {load} from 'cheerio';
+import {coverAsset} from '../fixtures/coverAsset.mjs';
+import {resolvePresentationVisuals} from '../../Service/visual/presentationVisuals.mjs';
+import {presentationLayoutService} from '../../Service/presentationLayoutService.mjs';
+import {presentationThemeService} from '../../Service/presentationThemeService.mjs';
+import {presentationRendererService} from '../../Service/presentationRendererService.mjs';
+import {generatePresentationBuffer} from '../../renderer/presentation/pptxRenderer.mjs';
+import {validateRenderedPptx} from '../../renderer/presentation/renderedOutputValidation.mjs';
+const ready=deck=>presentationRendererService(presentationThemeService(presentationLayoutService(deck)));
+for(const [topic,file,count,firstType] of [['Automotive design','auto-electric.jpg',1,'title'],['Fashion design','clothing.jpg',3,'title'],['Space exploration','space-orbit.jpg',10,'focused-explanation'],['Residential architecture','property-villa.jpg',12,'title']])test(`${count} slides: ${topic} has a full-slide embedded cover, including a ${firstType} first slide`,async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'ledify-cover-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const deck={title:topic,subtitle:'An educational overview',strategyId:'lecture-teaching',slides:Array.from({length:count},(_,i)=>({slideNumber:i+1,slideType:i===0?firstType:'focused-explanation',title:i===0?topic:`${topic}: perspective ${i+1}`,subtitle:'',content:i===0&&firstType==='title'?{titleContent:{title:topic,subtitle:'An educational overview',supportingText:'Explore the subject and its context.'}}:{textContent:{heading:topic,body:`${topic} connects design choices to practical requirements and careful evaluation.`}}}))};
+ const output=await resolvePresentationVisuals(ready(deck),{instructions:'Text-only supporting slides.',designPreferences:{noImageSlideNumbers:[1]}},{external:false,diagramPlanner:false,cacheRoot:root,userAssets:[await coverAsset(file,topic)]});
+ assert.equal(output.slides.length,count);assert.equal(output.slides[0].photoComposition,'hero-full-bleed');assert.equal(output.imageValidation.status,'passed');assert.equal(output.slides.filter(s=>s.photoAsset).length,1);
+ const rendered=await generatePresentationBuffer(output),filename=path.join(root,'cover.pptx');await fs.writeFile(filename,rendered.buffer);await validateRenderedPptx(filename,output);
+ const zip=await JSZip.loadAsync(rendered.buffer),xml=await zip.file('ppt/slides/slide1.xml').async('string'),$=load(xml,{xmlMode:true});
+ const full=$('p\\:pic').toArray().some(pic=>{const frame=$(pic).find('a\\:xfrm'),offset=frame.find('a\\:off'),size=frame.find('a\\:ext');return Number(offset.attr('x'))===0&&Number(offset.attr('y'))===0&&Math.abs(Number(size.attr('cx'))/914400-13.333333)<.01&&Math.abs(Number(size.attr('cy'))/914400-7.5)<.01;});
+ assert.equal(full,true);assert.ok(!xml.includes('AI-generated illustration'));assert.ok(!xml.includes('Illustrative photograph'));
+ const swapped=structuredClone(output);swapped.slides[0].photoAsset.binding.requestId='another-request';
+ await assert.rejects(generatePresentationBuffer(swapped),{code:'IMAGE_BINDING_MISMATCH'});
+ zip.remove('ppt/media/'+Object.keys(zip.files).find(name=>/^ppt\/media\/.+\.(png|jpe?g)$/.test(name)).split('/').at(-1));await fs.writeFile(filename,await zip.generateAsync({type:'nodebuffer'}));await assert.rejects(validateRenderedPptx(filename,output));
+});

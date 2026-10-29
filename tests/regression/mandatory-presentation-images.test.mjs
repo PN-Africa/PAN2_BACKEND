@@ -32,7 +32,7 @@ test('the actual failed ten-slide user PPTX with zero pictures fails the mandato
 test('missing cover providers fail clearly even when supporting slides are text-only',async t=>{
     const deck=ready(structuredClone(imagerySamples[4].presentation));
     await assert.rejects(resolvePresentationVisuals(deck,{}, {allowIncompleteImages:false,providers:{},cacheRoot:await temporary(t),diagramPlanner:false}),error=>error.code==='PRESENTATION_IMAGES_UNAVAILABLE'&&error.missingSlides.includes(1));
-    await assert.rejects(resolvePresentationVisuals(deck,{instructions:'Create a text-only presentation.'},{providers:{},cacheRoot:await temporary(t),diagramPlanner:false}),error=>error.code==='PRESENTATION_IMAGES_UNAVAILABLE'&&error.stage==='presentation-cover');
+    const textOnly=await resolvePresentationVisuals(deck,{instructions:'Create a text-only presentation.'},{providers:{},cacheRoot:await temporary(t),diagramPlanner:false});assert.equal(textOnly.imageCoveragePlan.coverRequired,false);assert.equal(textOnly.imageValidation.status,'passed');
 });
 test('charts, tables and relationship diagrams retain editable content beside distinct embedded pictures',async t=>{
     const root=await temporary(t),sample=structuredClone(imagerySamples[4].presentation);

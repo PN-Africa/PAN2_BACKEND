@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { fork } from 'node:child_process';
+import {trackedFork as fork} from '../../Service/renderProcesses.mjs';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import {trackedExecFile as execFile} from '../../Service/renderProcesses.mjs';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import {ppmToPng} from './ppmPng.mjs';

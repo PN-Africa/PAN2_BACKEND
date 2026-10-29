@@ -1,20 +1,22 @@
+import {incompleteFailure} from '../Service/incompleteFailure.mjs';
+import {generationOutcome} from '../Service/generationOutcome.mjs';
 import { resolveSlideCount } from '../Service/ai/slideCount.mjs';
 import generateModel from '../model/generateModel.mjs';
 import { fileService } from '../Service/fileService.mjs';
-import { urlService } from '../Service/urlService.mjs';
+import {urlSourceService,unpackUrlSource} from '../Service/input/urlUnderstanding.mjs';
 import { generateService } from '../Service/generateService.mjs';
 import { publicGenerationResult, compactOptionalContext } from '../Service/publicGenerationResult.mjs';
 import { validateUploadedFile } from '../Service/input/fileValidation.mjs';
 import { combineGenerationInput } from '../Service/input/combinedInput.mjs';
 import { addPresentationPublicUrls } from '../Service/presentationPublicUrls.mjs';
 import {prepareInputImageAssets,validateVisualAssetInputs} from '../Service/visual/inputImageAssets.mjs';
-import {profileGeneration,measureStage,performanceReport} from '../Service/performance.mjs';
+import {profileGeneration,measureStage,performanceReport,generationSignal} from '../Service/performance.mjs';
 import {generationJobs} from '../Service/generationJobs.mjs';
 import {validateTextPrompt} from '../Service/input/promptValidation.mjs';
 import {withGenerationCapacity} from '../Service/generationCapacity.mjs';
 import {inputAdmission} from '../Service/input/admission.mjs';
 
-export function createGenerationHandlers({ model = generateModel, generator = generateService, extractFile = fileService, extractUrl = urlService,jobRoot,jobOptions={},deliveryLogger=event=>console.info('[GENERATION_DELIVERY]',JSON.stringify(event)) } = {}) {
+export function createGenerationHandlers({ model = generateModel, generator = generateService, extractFile = fileService, extractUrl = urlSourceService,jobRoot,jobOptions={},deliveryLogger=event=>console.info('[GENERATION_DELIVERY]',JSON.stringify(event)) } = {}) {
     const handle = inputType => (req, res) => profileGeneration(async() => {
         const deliveryStarted=performance.now(),deliveryRequestId=performanceReport()?.requestId;
         res.once?.('finish',()=>{
@@ -24,6 +26,7 @@ export function createGenerationHandlers({ model = generateModel, generator = ge
             if(!res.writableFinished)try{deliveryLogger({requestId:deliveryRequestId,status:'client-disconnected',elapsedMs:Math.round(performance.now()-deliveryStarted),outputType:['presentation','webpage','document'].includes(req.body?.outputType)?req.body.outputType:'unknown'});}catch{}
         });
         let record;
+        const signal=req[inputAdmission]?.signal?AbortSignal.any([req[inputAdmission].signal,generationSignal()]):generationSignal();
         try {
             if(!req.body||typeof req.body!=='object'||Array.isArray(req.body))throw invalid('Provide a JSON object for text or URL requests, or a multipart form for the file endpoint.');
             const { outputType, slideCount } = req.body;
@@ -42,7 +45,7 @@ export function createGenerationHandlers({ model = generateModel, generator = ge
             if (outputType === 'presentation') resolveSlideCount('', context);
             let input, label,kind=inputType,sources;
             if(inputType==='combined') {
-                const combined=await measureStage('input-extraction',()=>combineGenerationInput({body:req.body,file:req.file,context,extractFile,extractUrl}));
+                const combined=await measureStage('input-extraction',()=>combineGenerationInput({body:req.body,file:req.file,context,extractFile,extractUrl,signal}));
                 ({input,label,sources}=combined);kind=combined.inputType;context=combined.context;
             } else if (inputType === 'file') {
                 if (!req.file) throw invalid('File is required');
@@ -52,7 +55,10 @@ export function createGenerationHandlers({ model = generateModel, generator = ge
                 const field = inputType === 'prompt' ? 'textPrompt' : 'urlPrompt';
                 if (typeof req.body[field] !== 'string' || !req.body[field].trim()) throw invalid(field + ' and outputType are required');
                 label = inputType==='prompt'?validateTextPrompt(req.body[field]):req.body[field];
-                input = inputType === 'url' ? await measureStage('input-extraction',()=>extractUrl(label)) : label;
+                if(inputType==='url'){
+                    const extracted=await measureStage('input-extraction',()=>extractUrl(label,{context,outputType,signal}));
+                    const source=unpackUrlSource(extracted,label,context);input=source.text;context=source.context;
+                }else input=label;
             }
             const visualInput=outputType==='presentation'?await prepareInputImageAssets(context,req.file):null;
             if(visualInput)context=visualInput.context;
@@ -75,16 +81,18 @@ export function createGenerationHandlers({ model = generateModel, generator = ge
                 if(projected.generatedContent?.inferredContext)projected.generatedContent.inferredContext=compactOptionalContext(projected.generatedContent.inferredContext);
                 return projected;
             });
-            record.status = result.status==='incomplete'?'failed':'completed'; record.generatedContent = result.generatedContent;
+            result.outcome=generationOutcome(result);
+            record.status = result.status==='incomplete'?'failed':'completed'; record.outcome=result.outcome; record.generatedContent = result.generatedContent;
             if (result.artifacts || result.preview) record.artifacts = result.artifacts || result.preview;
             await databaseOperation('database-save',()=>record.save());
             const legacy=req.get?.('X-Ledify-Response-Version')==='1';
-            const request=legacy?(record.toObject?.() || {...record}):Object.fromEntries(['_id','inputType','outputType','status','createdAt','updatedAt'].filter(k=>record[k]!=null).map(k=>[k,record[k]]));
+            const request=legacy?(record.toObject?.() || {...record}):Object.fromEntries(['_id','inputType','outputType','status','outcome','createdAt','updatedAt'].filter(k=>record[k]!=null).map(k=>[k,record[k]]));
             const status=result.status || 'completed';
             if(status==='incomplete'){
-                const pdfFailed=result.exportValidation?.status==='incomplete';
+                const failure=incompleteFailure(result);
+                const pdfFailed=failure.httpStatus===503;
                 if(pdfFailed)res.set?.('Retry-After','15');
-                return res.status(pdfFailed?503:422).json({message:pdfFailed?'PDF export is unavailable; Word download and preview remain available':'Generation is incomplete: required images could not be verified',errorCode:pdfFailed?'DOCUMENT_PDF_UNAVAILABLE':'IMAGE_REQUIREMENTS_UNMET',stage:pdfFailed?'document-export':'image-validation',data:{responseVersion:2,request:publicGenerationResult(request),result}});
+                return res.status(failure.httpStatus).json({message:failure.message,errorCode:failure.errorCode,stage:failure.stage,data:{responseVersion:2,request:publicGenerationResult(request),result}});
             }
             res.set?.('X-Ledify-Response-Version',legacy?'1':'2');
             if(result.timings) {
@@ -95,8 +103,16 @@ export function createGenerationHandlers({ model = generateModel, generator = ge
             const message=status==='partial_success'?'Generation partially completed; review warnings':status==='completed_with_warnings'?'Generated with quality warnings; review before use':`${outputType === 'presentation' ? 'Presentation' : outputType === 'webpage' ? 'Webpage' : 'Document'} generated successfully`;
             return res.status(201).json({ message, data: { responseVersion:legacy?1:2,request:publicGenerationResult(request),result } });
         } catch (error) {
-            if (record && error.code!=='DATABASE_UNAVAILABLE') { record.status = 'failed'; try { await record.save(); } catch {} }
+            if(res.destroyed)return;
+            if (record && error.code!=='DATABASE_UNAVAILABLE') { record.status = 'failed';record.outcome=generationOutcome({status:'failed'}); try { await record.save(); } catch {} }
+            if(signal?.reason?.code==='GENERATION_TIMEOUT'||error.code==='GENERATION_TIMEOUT'||error.code==='AI_PROVIDER_TIMEOUT'||error.code==='AI_RETRY_EXHAUSTED'&&error.lastErrorCode==='AI_PROVIDER_TIMEOUT')console.error('[GENERATION]',JSON.stringify({requestId:error.requestId||deliveryRequestId,outputType:req.body?.outputType,stage:signal?.reason?.code==='GENERATION_TIMEOUT'?'generation':error.stage||'generation',status:'failed',errorCode:signal?.reason?.code==='GENERATION_TIMEOUT'?'GENERATION_TIMEOUT':error.code,providerReason:error.providerReason,model:error.model}));
+            if(signal?.reason?.code==='GENERATION_TIMEOUT'||error.code==='GENERATION_TIMEOUT')return res.status(504).json({message:'The overall generation time budget was exhausted.',errorCode:'GENERATION_TIMEOUT',stage:'generation',requestId:deliveryRequestId});
+            if(error.code==='AI_PROVIDER_TIMEOUT'||error.code==='AI_RETRY_EXHAUSTED'&&error.lastErrorCode==='AI_PROVIDER_TIMEOUT')return res.status(504).json({message:error.stage==='url-content-understanding'?'AI content understanding timed out.':'AI generation request timed out.',errorCode:'AI_PROVIDER_TIMEOUT',stage:error.stage||'generation',requestId:error.requestId||deliveryRequestId,providerReason:'PROVIDER_TIMEOUT',model:error.model});
+            if(error.code==='SOURCE_CONTENT_INSUFFICIENT')return res.status(422).json({message:error.message,errorCode:error.code,stage:error.stage||'input-extraction'});
+            if(/^CLAUDE_WEB_FETCH_/.test(error.code||''))return res.status(502).json({message:'The public source could not be retrieved using the enabled methods.',errorCode:error.code,stage:'input-extraction'});
             const code = error.code || 'GENERATION_FAILED';
+            if(code==='PRESENTATION_QUALITY_FAILED'){console.error('[GENERATION]',JSON.stringify({requestId:error.requestId,status:'failed',errorCode:code,stage:error.stage,slideNumber:error.slideNumber,stopReason:error.stopReason,recoveryReason:error.recoveryReason,repairBudget:error.repairBudget,issues:error.qualityIssues}));return res.status(422).json({message:'Presentation content did not pass quality review.',errorCode:code,stage:error.stage,slideNumber:error.slideNumber,requestId:error.requestId,issues:error.qualityIssues,stopReason:error.stopReason,repairHistory:error.repairHistory,recoveryReason:error.recoveryReason,repairBudget:error.repairBudget});}
+            if(['DESIGN_SPEC_INVALID','UNSAFE_DESIGN_SVG','VISUAL_QUALITY_FAILED'].includes(code))return res.status(422).json({message:'The design could not meet validated rendering requirements.',errorCode:code,stage:error.stage,field:error.field});
             if(/^(?:ANTHROPIC_|CLAUDE_|AI_TEXT_)/.test(code))return res.status(503).json({message:'The configured text provider is not ready.',errorCode:code,stage:'text-provider',error:'Verify the configured Anthropic API key and exact Claude model. No alternative provider was selected.'});
             if(code==='DATABASE_UNAVAILABLE'){
                 res.set?.('Retry-After','15');
@@ -136,12 +152,12 @@ export function createGenerationHandlers({ model = generateModel, generator = ge
                 if(status===429)res.set?.('Retry-After','30');
                 return res.status(status).json({message:error.message,error:error.message,errorCode:code,stage:'input-extraction'});
             }
-            if(code==='AI_RETRY_EXHAUSTED'||code==='AI_SCHEMA_VALIDATION_FAILED')return res.status(502).json({message:'Generated content did not pass validation. No invalid artifact was published.',errorCode:code,stage:error.stage||'content-validation',field:error.field,validationRule:error.validationRule,requestId:error.requestId,lastErrorCode:error.lastErrorCode,retryable:false});
+            if(code==='AI_RETRY_EXHAUSTED'||code==='AI_SCHEMA_VALIDATION_FAILED')return res.status(502).json({message:'Generated content did not pass validation. No invalid artifact was published.',errorCode:code,stage:error.stage||'content-validation',field:error.field,validationRule:error.validationRule,requestId:error.requestId,lastErrorCode:error.lastErrorCode,validationErrors:error.validationErrors?.map(({field,maxCharacters})=>({field,maxCharacters})),stopReason:error.stopReason,retryable:false});
             const clientError = /^(INVALID_|SOURCE_URL|WEBPAGE_VALIDATION|WEBPAGE_STATIC)/.test(code);
             return res.status(clientError ? 400 : 500).json({ message: clientError ? error.message : 'Generation failed; see errorCode and stage', error: clientError ? error.message : 'Unable to complete generation',
                 errorCode: code, stage: error.stage||'generation', slideNumber: error.slideNumber,sectionId:error.sectionId,validationRule:error.validationRule, field: error.field, minCharacters:error.minCharacters,maxCharacters:error.maxCharacters, requestId: error.requestId, lastErrorCode: error.lastErrorCode });
         }
-    });
+    },{outputType:['presentation','webpage','document'].includes(req.body?.outputType)?req.body.outputType:'unknown'});
     return { userText: handle('prompt'), userUrl: handle('url'), userFile: handle('file'),userCombined:handle('combined') };
 }
 function invalid(message) { return Object.assign(new Error(message), { code: 'INVALID_REQUEST' }); }

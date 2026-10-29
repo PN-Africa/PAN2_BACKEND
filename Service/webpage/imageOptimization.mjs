@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {storageRoot} from '../storageRoot.mjs';
 
-let processing=0;const waiting=[];
+let processing=0;const waiting=[],pending=new Map();
 const capacity=process.env.LEDIFY_WEBPAGE_IMAGE_WORKERS==='2'?2:1;
 async function acquire(){
     if(processing<capacity){processing++;return;}
@@ -18,6 +18,20 @@ function release(){const next=waiting.shift();if(next){clearTimeout(next.timer);
 
 export async function optimizeWebsiteImage(buffer,{cacheRoot=process.env.LEDIFY_WEBPAGE_ASSET_CACHE || storageRoot('webpage-image-cache'),timeoutMs=12000}={}){
     if(!Buffer.isBuffer(buffer)||buffer.length>12*1024*1024)throw new Error('Invalid image byte budget');
+    const root=path.resolve(cacheRoot),digest=createHash('sha256').update(buffer).digest('hex');
+    // Share deterministic work, never mutable buffers or differing timeout policies.
+    const key=JSON.stringify([root,digest,timeoutMs]);
+    let task=pending.get(key);
+    if(!task){
+        task=optimizeImage(buffer,{cacheRoot:root,timeoutMs});pending.set(key,task);
+    }
+    try{
+        const result=await task;
+        return {...result,variants:result.variants.map(variant=>({...variant,buffer:Buffer.from(variant.buffer)}))};
+    }finally{if(pending.get(key)===task)pending.delete(key);}
+}
+
+async function optimizeImage(buffer,{cacheRoot,timeoutMs}){
     const id=createHash('sha256').update('webp-v1').update(buffer).digest('hex').slice(0,24),root=path.resolve(cacheRoot),metadataPath=path.join(root,id+'.json');
     try{
         const metadata=JSON.parse(await fs.readFile(metadataPath,'utf8'));

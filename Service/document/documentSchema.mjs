@@ -1,3 +1,4 @@
+import {designPlanSchema} from '../design/designSchema.mjs';
 const string = { type: 'string' };
 const strings = (maxItems = 20) => ({ type: 'array', maxItems, items: string });
 const blockFields = { type: 'object', properties: {
@@ -15,3 +16,4 @@ export const outlineSchema = { type:'object', properties: {
     coverPage:{type:'boolean'}, sections:{type:'array',maxItems:40,items:{type:'object',properties:{id:string,heading:string,objective:string,topics:strings(24),targetWords:{type:'integer'}},required:['id','heading','objective','topics','targetWords']}}
 }, required:['documentType','title','audience','purpose','tone','coverPage','sections'] };
 export const reviewSchema = {type:'object',properties:{issues:{type:'array',maxItems:12,items:{type:'object',properties:{sectionId:string,instruction:string},required:['sectionId','instruction']}}},required:['issues']};
+outlineSchema.properties.artifactDesign=designPlanSchema('document');

@@ -83,7 +83,7 @@ export const presentationRendererService = (
     // 3. RESOLVE DESIGN TOKENS
     // =====================================================
 
-    const designTokens =
+    const designTokens = presentation.design.tokens ||
         getPresentationDesignTokens(
             themeId,
             variantId
@@ -161,6 +161,7 @@ export const presentationRendererService = (
         // ---------------------------------------------
 
         design: {
+            ...presentation.design,
 
             themeId,
 

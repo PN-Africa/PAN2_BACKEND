@@ -132,10 +132,10 @@ test('relevance includes verified Commons categories when a vehicle filename con
 
 test('destination scene directions fall back to concise location searches without adding another location',async()=>{
     const queries=[];
-    const result=await commonsSearch({searchQuery:'Maldives overwater bungalows turquoise ocean aerial view',slideTitle:'Maldives',subject:'Travel destinations'}, {find:async q=>{
+    const result=await commonsSearch({searchQuery:'Maldives overwater bungalows turquoise ocean aerial view',slideTitle:'Maldives',subject:'Travel destinations',maxSearchQueries:2}, {find:async q=>{
         queries.push(q);return q==='Maldives'?[{mediaKind:'photograph',originalUrl:'https://commons.wikimedia.org/wiki/File:Maldives_lagoon.jpg',description:'Maldives lagoon',downloadUrl:'https://example.org/maldives.jpg'}]:[];
     },download:async()=>({buffer:Buffer.from('photo')})});
-    assert.equal(result.buffer.toString(),'photo');assert.equal(queries.at(-1),'Maldives');assert.ok(queries.length<=5);
+    assert.equal(result.buffer.toString(),'photo');assert.equal(queries.at(-1),'Maldives');assert.ok(queries.length<=2);
     assert.ok(stockSearchQueries('Bali Tegallalang rice terraces morning mist Indonesia lush',{slideTitle:'Bali in Indonesia'}).includes('Bali Indonesia'));
     assert.deepEqual(stockSearchQueries('File:Swiss Alps.jpg'),['File:Swiss Alps.jpg']);
     assert.ok(stockSearchQueries('scenic landscape golden hour mountains ocean',{slideTitle:'Travel destinations',subject:'Travel destinations'}).includes('scenic landscape'));

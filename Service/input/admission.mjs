@@ -9,7 +9,7 @@ export async function admitGenerationInput(req,res,next){
  try{
   const releaseSlot=await inputCapacity.acquire({signal:controller.signal});let released=false;
   const release=()=>{if(released)return;released=true;releaseSlot();res.removeListener('close',abort);};
-  req[inputAdmission]={release,waitMs:Math.round(performance.now()-started)};
+  req[inputAdmission]={release,signal:controller.signal,waitMs:Math.round(performance.now()-started)};
   res.once('finish',release);res.once('close',release);
   if(controller.signal.aborted||res.destroyed){release();return;}
   next();

@@ -1,3 +1,5 @@
+import {incompleteFailure} from './incompleteFailure.mjs';
+import {generationOutcome} from './generationOutcome.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomBytes,randomUUID,createHash,timingSafeEqual} from 'node:crypto';
@@ -5,6 +7,7 @@ import {profileGeneration,measureStage} from './performance.mjs';
 import {publicGenerationResult} from './publicGenerationResult.mjs';
 import {storageRoot} from './storageRoot.mjs';
 import {withGenerationCapacity,generationConcurrencySettings} from './generationCapacity.mjs';
+import {atomicJobJson} from './atomicJobJson.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const queues=new Map();
@@ -12,22 +15,20 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
     root=path.resolve(root);
     if(queues.has(root))return queues.get(root);
     if(!Number.isInteger(workerConcurrency)||workerConcurrency<1||workerConcurrency>4)throw new Error('Job concurrency must be between one and four');
-    let ready,active=0,admissions=0;const pending=[],retrying=new Set();
+    let ready,active=0,admissions=0,draining=false;const pending=[],retrying=new Set();
     const filename=(id,name)=>path.join(root,id,name);
     const validId=id=>/^[a-f0-9-]{36}$/.test(id);
     const log=entry=>{try{logger(entry);}catch{}};
+    const snapshots=new Map();let snapshotBytes=0;
     async function writeAtomic(file,value){
-        const temp=file+'.'+randomUUID()+'.tmp';await fs.writeFile(temp,JSON.stringify(value));
-        try{for(let attempt=0;;attempt++){
-            try{await fs.rename(temp,file);return;}
-            // Windows scanners/readers can hold status.json briefly. Preserve
-            // atomic replacement and retry that lock, never delete the last
-            // durable status or rerun the completed AI work because of it.
-            catch(error){if(attempt>=10||!['EPERM','EACCES','EBUSY'].includes(error.code))throw error;await new Promise(resolve=>setTimeout(resolve,Math.min(250,10*2**attempt)));}
-        }}finally{await fs.unlink(temp).catch(()=>{});}
+        const text=await atomicJobJson(file,value,{onRetry:entry=>log({status:'storage-retry',...entry})});
+        if(path.basename(file)==='status.json'){
+            snapshotBytes-=Buffer.byteLength(snapshots.get(file)||'');snapshots.delete(file);snapshots.set(file,text);snapshotBytes+=Buffer.byteLength(text);
+            while(snapshots.size>64||snapshotBytes>8*1024*1024){const key=snapshots.keys().next().value;snapshotBytes-=Buffer.byteLength(snapshots.get(key));snapshots.delete(key);}
+        }
     }
     const atomic=(file,value)=>measureStage('job-storage',()=>writeAtomic(file,value));
-    async function load(id){if(!validId(id))throw Object.assign(new Error('Job not found'),{status:404});return JSON.parse(await fs.readFile(filename(id,'status.json'),'utf8'));}
+    async function load(id){if(!validId(id))throw Object.assign(new Error('Job not found'),{status:404});const file=filename(id,'status.json');return JSON.parse(snapshots.get(file)??await fs.readFile(file,'utf8'));}
     async function init(){
         if(!ready)ready=(async()=>{
             await fs.mkdir(root,{recursive:true});
@@ -51,6 +52,7 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
         return ready;
     }
     function pump(){
+        if(draining)return;
         while(active<workerConcurrency&&pending.length){
             const id=pending.shift();active++;
             runJob(id).catch(error=>{try{onError?.(error);}catch{}}).finally(()=>{active--;setImmediate(pump);});
@@ -76,6 +78,7 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
                     ai:{...payload.options?.ai,
                         ...(payload.outputType==='presentation'?{initialPresentation:partial}:{initialPlan:plan,...(payload.outputType==='document'?{initialSections:partial?.sections}:{})}),
                         onPlan:plan=>atomic(filename(id,'plan.json'),plan),
+                        onQualityReview:(review,round)=>atomic(filename(id,`quality-review-${round}.json`),{round,review}),
                         onSlideCheckpoint:partial=>atomic(filename(id,'partial.json'),partial),
                         onCheckpoint:partial=>atomic(filename(id,'partial.json'),partial)},
                     onContentReady:content=>atomic(filename(id,'content.json'),content),
@@ -89,13 +92,13 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
                 job.completedAt=new Date().toISOString();
                 job.timings.executionMs=Math.round(performance.now()-executionStarted);
                 job.timings.totalMs=job.timings.queueWaitMs+job.timings.executionMs;
-                const safe=result;safe.performance=finalPerformance;
+                const safe=result;safe.performance=finalPerformance;safe.outcome=generationOutcome(safe);
                 const incomplete=safe.status==='incomplete';
-                const pdfFailed=safe.exportValidation?.status==='incomplete';
-                await update({status:incomplete?'failed':'completed',result:safe,...(incomplete?{error:pdfFailed?{errorCode:'DOCUMENT_PDF_UNAVAILABLE',stage:'document-export',message:'PDF export is unavailable; Word and preview remain available.'}:{errorCode:'IMAGE_REQUIREMENTS_UNMET',stage:'image-validation',message:'Required images are missing. Available artifacts are incomplete; retry or provide authorized assets.'}}:{})});
+                const {httpStatus,...failure}=incompleteFailure(safe);
+                await update({status:incomplete?'failed':'completed',outcome:safe.outcome,result:safe,...(incomplete?{error:failure}:{})});
                 log({requestId:id,status:job.status,resultStatus:safe.status,outputType:payload.outputType,...job.timings});
-                try{await model?.findByIdAndUpdate?.(payload.recordId,{$set:{status:incomplete?'failed':'completed',generatedContent:safe.generatedContent,artifacts:safe.artifacts||safe.preview}});}
-                catch{await update({warnings:[{code:'JOB_RECORD_UPDATE_FAILED',message:'Output is available; its MongoDB request record could not be updated.'}]});}
+                try{await model?.findByIdAndUpdate?.(payload.recordId,{$set:{status:incomplete?'failed':'completed',outcome:safe.outcome,generatedContent:safe.generatedContent,artifacts:safe.artifacts||safe.preview}});}
+                catch{try{await update({warnings:[{code:'JOB_RECORD_UPDATE_FAILED',message:'Output is available; its MongoDB request record could not be updated.'}]});}catch{log({requestId:id,status:'completed-with-storage-warning',errorCode:'JOB_RECORD_UPDATE_FAILED'});}}
             }catch(error){
                 await writes.catch(()=>{});
                 try{onError?.(error);}catch{}
@@ -105,7 +108,8 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
     }
     const api={
         async enqueue(payload){
-            await init();if(pending.length+admissions>=maxPending)throw Object.assign(new Error('Generation queue is full. Retry shortly.'),{code:'GENERATION_QUEUE_FULL'});
+            if(draining)throw Object.assign(new Error('Generation service is draining; retry after restart.'),{code:'GENERATION_QUEUE_FULL'});
+            await init();if(draining||pending.length+admissions>=maxPending)throw Object.assign(new Error('Generation queue is full or draining. Retry shortly.'),{code:'GENERATION_QUEUE_FULL'});
             admissions++;
             try{
             const id=randomUUID(),token=randomBytes(32).toString('hex');await fs.mkdir(path.join(root,id));
@@ -124,6 +128,7 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
             const {tokenHash,runs,...safe}=job;return safe;
         },
         async retry(id,token){
+            if(draining)throw Object.assign(new Error('Generation service is draining.'),{code:'GENERATION_QUEUE_FULL',status:503});
             if(retrying.has(id))throw Object.assign(new Error('A retry is already being scheduled'),{status:409});
             retrying.add(id);try{
             const safe=await api.read(id,token);
@@ -139,6 +144,7 @@ export function generationJobs({generator,model,root=process.env.LEDIFY_JOB_ROOT
             }finally{retrying.delete(id);}
         },
         initialize:init,
+        async quiesce({timeoutMs=25000}={}){draining=true;const until=Date.now()+timeoutMs;while((active||admissions)&&Date.now()<until)await new Promise(resolve=>setTimeout(resolve,25));return {active,queued:pending.length,checkpointed:true};},
         capacity:()=>({active,queued:pending.length,admissions,workerConcurrency,maxPending})
     };
     queues.set(root,api);return api;

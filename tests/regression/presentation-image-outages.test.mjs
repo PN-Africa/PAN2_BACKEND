@@ -55,7 +55,7 @@ test('all presentation inputs deliver usable artifacts with honest warnings duri
     const cover=await coverAsset('laboratory.jpg','Laboratory research');
     let result;
     const app=createApp({jobRoot:path.join(root,'jobs'),model:{create:async v=>({...v,async save(){}})},extractUrl:async()=> 'Source article',generator:async(kind,input,output,context)=>{
-        result??=await generateService(kind,input,output,context,{completedContent:{inputType:kind,input,outputType:output,generatedContent:content},visuals:{cacheRoot:root,userAssets:[cover],providers:{search:async()=>{throw new Error('Provider offline');},generate:async()=>null},policy:{retries:0},diagramPlanner:false}});
+        result??=await generateService(kind,input,output,{...context,instructions:'Every slide must include an authentic photograph.'},{completedContent:{inputType:kind,input,outputType:output,generatedContent:content},visuals:{cacheRoot:root,userAssets:[cover],providers:{search:async()=>{throw new Error('Provider offline');},generate:async()=>null},policy:{retries:0},diagramPlanner:false}});
         return result;
     }});
     const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});t.after(()=>server.close());

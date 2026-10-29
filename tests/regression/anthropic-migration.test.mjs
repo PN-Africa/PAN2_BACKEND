@@ -9,6 +9,7 @@ import {generateImage,imageGenerationSettings} from '../../Service/visual/imageG
 import {websiteImageProviders} from '../../Service/webpage/imageProviders.mjs';
 import {configuredImageProviders} from '../../Service/visual/imageProviders.mjs';
 import {containerResources} from '../../Service/runtimeResources.mjs';
+import {reviewGeneratedImage} from '../../Service/visual/generatedImageReview.mjs';
 const model='claude-opus-5-5',env={CLAUDE_MODEL:model},schema={type:'object',properties:{title:{type:'string',maxLength:12}},required:['title'],additionalProperties:false};
 const info={id:model,capabilities:{structured_outputs:{supported:true},effort:{supported:true}}};
 const response=title=>({model,stop_reason:'end_turn',content:[{type:'text',text:JSON.stringify({title})}],usage:{input_tokens:100,output_tokens:20,cache_read_input_tokens:12,cache_creation_input_tokens:4}});
@@ -71,4 +72,29 @@ test('container diagnostics distinguish unobservable host resources from measure
  assert.equal((await containerResources({platform:'win32'})).available,false);
  const values={'memory.current':'12345','memory.max':'536870912','cpu.stat':'usage_usec 1000\nthrottled_usec 42','cpu.max':'50000 100000','io.stat':'8:0 rbytes=12 wbytes=34'};
  const result=await containerResources({platform:'linux',read:async file=>values[path.basename(file)]});assert.equal(result.cpuQuotaCores,.5);assert.equal(result.memoryLimitBytes,536870912);assert.equal(result.ioWriteBytes,34);
+});
+
+test('optional Claude vision review sends actual raster bytes and rejects unrelated generated scenes',async()=>{
+ let accepted=true,calls=0;const buffer=await fs.readFile('assets/webpage/curated/laboratory.jpg');
+ const client=createAnthropicService({env,sdk:{models:{retrieve:async()=>info},messages:{create:async body=>{
+  calls++;assert.equal(body.messages[0].content[1].source.media_type,'image/jpeg');assert.equal(body.messages[0].content[1].source.data,buffer.toString('base64'));
+  return {...response('unused'),content:[{type:'text',text:JSON.stringify({accepted,reason:accepted?'MATCH':'SUBJECT_MISMATCH'})}]};
+ }}}});
+ const input={buffer,mimeType:'image/jpeg',prompt:'Laboratory research equipment'};
+ assert.equal((await reviewGeneratedImage(input,{env:{},client})).status,'not-run');assert.equal(calls,0);
+ assert.equal((await reviewGeneratedImage(input,{env:{AI_IMAGE_SEMANTIC_REVIEW:'true'},client,logger:()=>{}})).status,'passed');accepted=false;
+ await assert.rejects(reviewGeneratedImage(input,{env:{AI_IMAGE_SEMANTIC_REVIEW:'true'},client,logger:()=>{}}),{code:'IMAGE_SEMANTIC_REJECTED'});
+});
+
+test('a lost paid POST receipt cannot cause automatic duplicate image submissions',async t=>{
+ const root=await temporary(t);let posts=0;
+ const options={env:{AI_IMAGE_PROVIDER:'bfl',AI_IMAGE_MODEL:'flux-2-pro',AI_IMAGE_PROVIDER_APPROVED:'true',AI_IMAGE_API_KEY:'test'},cacheRoot:root,fetch:async()=>{posts++;throw new Error('Connection lost after submission');}};
+ for(let i=0;i<2;i++)await assert.rejects(generateImage({prompt:'A laboratory scene'},options),{code:'IMAGE_RESULT_UNAVAILABLE'});
+ assert.equal(posts,1);
+});
+
+test('a confirmed BFL authentication rejection preserves its HTTP status without polling or hidden retries',async t=>{
+ const root=await temporary(t);let calls=0;
+ await assert.rejects(generateImage({prompt:'A laboratory scene'},{env:{AI_IMAGE_PROVIDER:'bfl',AI_IMAGE_MODEL:'flux-2-pro',AI_IMAGE_PROVIDER_APPROVED:'true',AI_IMAGE_API_KEY:'invalid-test'},cacheRoot:root,fetch:async()=>{calls++;return new Response('{}',{status:401});}}),error=>error.code==='IMAGE_PROVIDER_HTTP_ERROR'&&error.status===401);
+ assert.equal(calls,1);
 });

@@ -64,7 +64,7 @@ test('a title-only coverage assertion is rejected instead of accepted as adequat
 });
 test('persistent substantive issues stop after bounded repairs',async()=>{
     let repairs=0;const client={models:{generateContent:async()=>({text:JSON.stringify({coverage:[],issues:[{slideNumber:2,severity:'error',code:'FACTUAL',message:'Wrong actor.',repairInstruction:'Preserve the source actor.'}]}),candidates:[{finishReason:'STOP'}]})}};
-    await assert.rejects(reviewAndRepairPresentation({presentation:base(),input:'Explain a subject.',inputType:'prompt',context:{},client,requestId:'fixture',options:{logger:()=>{}},repairSlide:async slide=>{repairs++;return slide.content;}}),e=>e.code==='PRESENTATION_QUALITY_FAILED');assert.equal(repairs,2);
+    await assert.rejects(reviewAndRepairPresentation({presentation:base(),input:'Explain a subject.',inputType:'prompt',context:{},client,requestId:'fixture',options:{logger:()=>{}},repairSlide:async slide=>{repairs++;return slide.content;}}),e=>e.code==='PRESENTATION_QUALITY_FAILED'&&e.stopReason==='NO_MEANINGFUL_REPAIR');assert.equal(repairs,1);
 });
 test('three processes select genuinely distinct geometry while preserving a deliberate comparison series',()=>{
     const deck=base();deck.slides=Array.from({length:3},(_,i)=>({slideNumber:i+1,slideType:'process',title:'Stage '+(i+1),content:{process:structuredClone(fixtures.process)}}));

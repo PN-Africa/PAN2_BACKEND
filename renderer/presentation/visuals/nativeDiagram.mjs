@@ -1,26 +1,15 @@
 import { validateDiagram } from './svgGraphics.mjs';
 import { assertTextFits } from '../contentFit.mjs';
+import {routeDiagramConnectors} from './connectorRouting.mjs';
 
-export function renderNativeDiagram({ slide, diagram, box, ink, accent, fontFace, slideNumber }) {
+export function renderNativeDiagram({ slide, diagram, box, ink, accent, fontFace, slideNumber,validationErrors,onTextLayout }) {
     validateDiagram(diagram);
     const { x,y,w,h }=box,cols=['labeled','cycle'].includes(diagram.kind)||diagram.nodes.length>Math.floor(h/1.15)?2:1,rows=Math.ceil(diagram.nodes.length/cols),rowH=h/rows;
     const gap=.35,nodeW=cols===2?(w-gap)/2:w*.65;
     const cycleSlots=Array.from({length:rows},(_,i)=>[1,i]).concat(Array.from({length:rows},(_,i)=>[0,rows-1-i]));
     // Cycle order follows the perimeter; a closing edge returns to the start.
     const positions=diagram.nodes.map((node,i)=>{const slot=diagram.kind==='cycle'?cycleSlots[(i+cycleSlots.length-1)%cycleSlots.length]:[i%cols,Math.floor(i/cols)];return {...node,x:x+slot[0]*(nodeW+gap),y:y+slot[1]*rowH};});
-    const byId=Object.fromEntries(positions.map(n=>[n.id,n]));
-    for(const edge of diagram.edges){
-        const a=byId[edge.from],b=byId[edge.to];
-        const x1=a.x+nodeW-.08,y1=a.y+rowH*.48,x2=b.x+nodeW-.08,y2=b.y+rowH*.48;
-        if(a.x===b.x) slide.addShape('line',{x:x1+.12,y:Math.min(y1,y2),w:0,h:Math.abs(y2-y1),line:{color:accent,width:1.4,...(y2>y1?{endArrowType:'triangle'}:{beginArrowType:'triangle'})}});
-        else if(a.y===b.y) slide.addShape('line',{x:Math.min(a.x,b.x)+nodeW,y:y1,w:gap,h:0,line:{color:accent,width:1.4,...(b.x>a.x?{endArrowType:'triangle'}:{beginArrowType:'triangle'})}});
-        else {
-            const mid=x+nodeW+gap/2,start=b.x>a.x?a.x+nodeW:a.x,end=b.x>a.x?b.x:b.x+nodeW;
-            slide.addShape('line',{x:Math.min(start,mid),y:y1,w:Math.abs(mid-start),h:0,line:{color:accent,width:1.4}});
-            slide.addShape('line',{x:mid,y:Math.min(y1,y2),w:0,h:Math.abs(y2-y1),line:{color:accent,width:1.4}});
-            slide.addShape('line',{x:Math.min(mid,end),y:y2,w:Math.abs(end-mid),h:0,line:{color:accent,width:1.4,...(end>mid?{endArrowType:'triangle'}:{beginArrowType:'triangle'})}});
-        }
-    }
+    const byId=Object.fromEntries(positions.map(n=>[n.id,n])),nodeBoxes=[],labelBoxes=[];
     // Branches can share source/target rows. Give every relationship a distinct
     // numbered legend slot instead of drawing several labels at one anchor.
     const labeledEdges=diagram.edges.filter(edge=>edge.label);
@@ -35,18 +24,32 @@ export function renderNativeDiagram({ slide, diagram, box, ink, accent, fontFace
         const anchor=branchLegend?positions[i%positions.length]:originalAnchors[i],lane=branchLegend?Math.floor(i/positions.length):0;
         const value=branchLegend?`${from}→${to}: ${edge.label}`:edge.label;
         const labelW=cols===2?nodeW-.3:w-nodeW-.25,labelH=cols===2?.35:Math.min(.7,rowH-.1);
-        const field=`visual.diagram.edges[${i}].label`;
-        assertTextFits(value,{w:labelW,h:labelH,fontSize:18},field,slideNumber);
-        slide.addText(value,{x:cols===2?anchor.x:x+nodeW+.25,y:cols===2?anchor.y+rowH-.35*legendRows+lane*.35:anchor.y+rowH*.6,w:labelW,h:labelH,fontFace,fontSize:18,color:ink,margin:0,_field:field});
+        const field=`visual.diagram.edges[${diagram.edges.indexOf(edge)}].label`;
+        const overhead=value.length-edge.label.length;
+        onTextLayout?.({field,w:labelW,h:labelH,fontSize:18,overhead});
+        try{assertTextFits(value,{w:labelW,h:labelH,fontSize:18},field,slideNumber);}catch(error){if(overhead)error.maxCharacters=Math.max(1,error.maxCharacters-overhead);if(!validationErrors)throw error;validationErrors.push(error);}
+        const textBox={x:cols===2?anchor.x:x+nodeW+.25,y:cols===2?anchor.y+rowH-.35*legendRows+lane*.35:anchor.y+rowH*.6,w:labelW,h:labelH};labelBoxes.push(textBox);
+        slide.addText(value,{...textBox,fontFace,fontSize:18,color:ink,margin:0,_field:field});
     }
     for(const [i,node] of positions.entries()){
         const size=20,labelH=cols===2?Math.max(.4,Math.min(.8,rowH*.26)):.38,descH=Math.min(.8,rowH-labelH-(cols===2?.2+.35*legendRows:.2));
+        nodeBoxes.push({id:node.id,x:node.x,y:node.y+.08,w:nodeW-.3,h:node.description?labelH+.02+Math.max(.01,descH):labelH});
         const add=(value,yy,hh,fs,bold,field)=>{
-            if(!value) return; assertTextFits(value,{w:nodeW-.3,h:hh,fontSize:fs},field,slideNumber);
+            if(!value) return;const overhead=field.endsWith('.label')&&branchLegend?String(i+1).length+2:0;onTextLayout?.({field,w:nodeW-.3,h:hh,fontSize:fs,overhead});try{assertTextFits(value,{w:nodeW-.3,h:hh,fontSize:fs},field,slideNumber);}catch(error){if(overhead)error.maxCharacters=Math.max(1,error.maxCharacters-overhead);if(!validationErrors)throw error;validationErrors.push(error);}
             slide.addText(value,{x:node.x,y:yy,w:nodeW-.3,h:hh,fontSize:fs,fontFace,color:ink,bold,margin:0,breakLine:false,valign:'top',_field:field});
         };
-        slide.addShape('line',{x:node.x,y:node.y-.04,w:nodeW-.3,h:0,line:{color:accent,width:2}});
         add(branchLegend?`${i+1}. ${node.label}`:node.label,node.y+.08,labelH,size,true,`visual.diagram.nodes[${i}].label`);
         if(node.description) add(node.description,node.y+labelH+.1,Math.max(.01,descH),18,false,`visual.diagram.nodes[${i}].description`);
+    }
+    // Invalid dry-run text is already collected for repair. Never mask those
+    // actionable density errors with a route error from the same invalid boxes.
+    if(validationErrors?.length)return;
+    const routes=routeDiagramConnectors(nodeBoxes,diagram.edges,box,{obstacles:labelBoxes}),ports=new Set();
+    for(const route of routes){
+        for(const point of [route.points[0],route.points.at(-1)]){const key=`${point.x}:${point.y}`;if(ports.has(key))continue;ports.add(key);slide.addShape('ellipse',{x:point.x-.025,y:point.y-.025,w:.05,h:.05,line:{color:accent,transparency:100},fill:{color:accent}});}
+        for(const [i,s] of route.segments.entries()){
+            const backwards=s.x2<s.x1||s.y2<s.y1,terminal=i===route.segments.length-1;
+            slide.addShape('line',{x:Math.min(s.x1,s.x2),y:Math.min(s.y1,s.y2),w:Math.abs(s.x2-s.x1),h:Math.abs(s.y2-s.y1),line:{color:accent,width:1.4,transparency:0,...(terminal?backwards?{beginArrowType:'triangle'}:{endArrowType:'triangle'}:{})}});
+        }
     }
 }

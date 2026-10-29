@@ -2,17 +2,28 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {pathToFileURL} from 'node:url';
-import {execFile} from 'node:child_process';
+import {trackedExecFile as execFile} from '../renderProcesses.mjs';
 import {promisify} from 'node:util';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
 import {PDFParse} from 'pdf-parse';
 import {presentationRenderQueue} from '../../renderer/presentation/renderQueue.mjs';
 const execute=promisify(execFile),pending=new Map();
+const validated=new Map();
 const unavailable=()=>Object.assign(new Error('PDF export is temporarily unavailable. The Word download remains available. Retry or ask the service owner to check LibreOffice Writer.'),{code:'DOCUMENT_PDF_UNAVAILABLE',stage:'document-export',status:503});
 export async function validateDocumentPdf(buffer){
     if(!Buffer.isBuffer(buffer)||buffer.length<100||buffer.subarray(0,5).toString()!=='%PDF-')throw unavailable();
+    // Hash every byte: a changed or corrupt download must pass the parser again.
+    // Retain only small successful validation summaries, never document text.
+    const key=createHash('sha256').update(buffer).digest('hex'),now=Date.now();
+    for(const [digest,entry] of validated)if(entry.expires<=now)validated.delete(digest);
+    const cached=validated.get(key);if(cached)return {...cached.result};
     const parser=new PDFParse({data:buffer});
-    try{const result=await parser.getText();if(!result.total||!result.text?.trim())throw unavailable();return {status:'passed',pages:result.total,characters:result.text.trim().length};}finally{await parser.destroy();}
+    try{
+        const result=await parser.getText();if(!result.total||!result.text?.trim())throw unavailable();
+        const summary={status:'passed',pages:result.total,characters:result.text.trim().length};
+        if(validated.size>=32)validated.delete(validated.keys().next().value);
+        validated.set(key,{expires:Date.now()+60000,result:summary});return {...summary};
+    }finally{await parser.destroy();}
 }
 // Always convert the same saved DOCX used by the Word download. GET requests
 // coalesce per document and reuse a validated PDF; failures preserve DOCX.

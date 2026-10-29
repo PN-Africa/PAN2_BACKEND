@@ -67,7 +67,7 @@ export async function imageBackoff(error,attempt,{signal,remainingMs=Infinity,sl
     });return !signal?.aborted;
 }
 export function imageDiagnostic(entry,logger=value=>console.info('[IMAGE_ASSET]',JSON.stringify(value))) {
-    const safe={requestId:performanceReport()?.requestId||entry.requestId||randomUUID(),...Object.fromEntries(Object.entries(entry).filter(([key])=>['generationType','provider','model','slideNumber','target','status','attempt','retryCount','reasonCode','providerStatus','elapsedMs','storage','validation','cacheHit','requested','succeeded','failed','requiredMissing'].includes(key)))};
+    const safe={requestId:performanceReport()?.requestId||entry.requestId||randomUUID(),...Object.fromEntries(Object.entries(entry).filter(([key])=>['generationType','provider','model','slideNumber','target','status','attempt','retryCount','reasonCode','providerStatus','elapsedMs','storage','validation','cacheHit','requested','succeeded','failed','requiredMissing','requirementId','searchRounds','candidateCount','resolution','aspectRatio','estimatedImageOutputCostUsd','usageAvailable'].includes(key)))};
     logger(safe);return safe;
 }
 export async function validateImageBytes(buffer,{minWidth=100,minHeight=100,requireVariance=false}={}) {

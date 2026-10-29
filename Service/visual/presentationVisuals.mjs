@@ -9,10 +9,12 @@ import { configuredImageProviders } from './imageProviders.mjs';
 import { validateRenderContent } from '../../renderer/presentation/professionalLayouts.mjs';
 import {createImageAssetSession} from './presentationImageAssets.mjs';
 import {imagePolicy} from './imagePolicy.mjs';
-import {planImageCoverage,imageCoverage,photoSignature,requiresAuthenticPhotography} from './imageArtDirection.mjs';
+import {planImageCoverage,imageCoverage,photoSignature,photoSubjectSignature,requiresAuthenticPhotography} from './imageArtDirection.mjs';
 import {generateIndependent,generationConcurrency} from '../ai/concurrency.mjs';
 import {imageDiagnostic} from './imageAssetService.mjs';
 import {storageRoot} from '../storageRoot.mjs';
+import {recoverSlideLayout} from './layoutRecovery.mjs';
+import {measureStage,performanceRequestId} from '../performance.mjs';
 
 export function imageDimensions(buffer) {
     if (!Buffer.isBuffer(buffer) || buffer.length > 12 * 1024 * 1024) throw new Error('Image exceeds the byte limit');
@@ -92,6 +94,7 @@ export async function prepareBackground(providerAsset, theme, root, focal = { x:
 }
 
 export async function resolvePresentationVisuals(presentation, context = {}, options = {}) {
+    if(options.userAssets?.length)context={...context,designPreferences:{...context.designPreferences,requiredImageSlideNumbers:[...(context.designPreferences?.requiredImageSlideNumbers||[]),...options.userAssets.map(a=>a.slideNumber)]}};
     presentation=planImageCoverage(presentation,context);
     for(const asset of options.userAssets||[]){
         if(asset.slideNumber!==presentation.slides[0]?.slideNumber&&context.designPreferences?.noImageSlideNumbers?.includes(asset.slideNumber))continue;
@@ -103,6 +106,8 @@ export async function resolvePresentationVisuals(presentation, context = {}, opt
     if(options.userAssets?.length)presentation=planImageCoverage(presentation,context);
     const theme=deriveVisualTheme(presentation,context),root=path.resolve(options.cacheRoot || storageRoot('visual-assets'));
     const providers=options.providers || configuredImageProviders(),warnings=[],slides=[];
+    const repairAttempts=new Set();
+    const validateLayout=slide=>measureStage('visual-layout-validation',async()=>{const repairText=options.repairText?((entries,validation)=>{if(repairAttempts.has(slide.slideNumber))return null;repairAttempts.add(slide.slideNumber);return options.repairText(entries,validation);}):undefined;const recovered=await recoverSlideLayout(slide,{tokens:presentation.design.tokens,repairText,logger:options.layoutLogger});Object.assign(slide,recovered);},{slideNumber:slide.slideNumber});
     const policy={...imagePolicy(),...options.policy,...(options.providerTimeoutMs?{timeoutMs:options.providerTimeoutMs}:{})};
     const session=options.prefetch?.session||createImageAssetSession({providers,policy,root,external:options.external!==false,userAssets:options.userAssets||[],onDiagnostic:options.onImageDiagnostic||(({reason,...safe})=>console.info('[IMAGE]',JSON.stringify(safe)))});
     const strict=options.allowIncompleteImages===false||options.allowIncompleteImages!==true&&policy.failureMode==='strict';
@@ -111,6 +116,10 @@ export async function resolvePresentationVisuals(presentation, context = {}, opt
     const assets=await Promise.all(requested.map(async s=>{
         const early=options.prefetch?.entries.get(s.slideNumber);
         if(early?.signature===photoSignature(s,presentation,context))return early.promise;
+        if(s.contentFallback&&early?.subjectSignature===photoSubjectSignature(s,presentation,context)&&options.prefetch.session?.reframe){
+            const approved=await early.promise;
+            if(approved&&!Array.isArray(approved))return options.prefetch.session.reframe(approved,presentation,s,theme,context);
+        }
         const direct=(options.userAssets||[]).filter(a=>a.slideNumber===s.slideNumber);
         if(direct.length===2)return Promise.all(direct.map(a=>session.resolve(presentation,s,theme,context,{...a,composition:'photo-grid'})));
         return session.resolve(presentation,s,theme,context);
@@ -134,7 +143,7 @@ export async function resolvePresentationVisuals(presentation, context = {}, opt
         if(photo){
             slide.photoAsset=photo;slide.photoComposition=photo.artDirection.composition;
             if(Array.isArray(resolved))slide.photoAssets=resolved.filter(Boolean);
-            try{validateRenderContent(slide);slide.visualResolution={status:'resolved',method:photo.generationMethod};return {slide,warnings};}
+            try{await validateLayout(slide);slide.visualResolution={status:'resolved',method:photo.generationMethod};return {slide,warnings};}
             catch(error){
                 if(slide.isCover)throw Object.assign(error,{code:'PRESENTATION_IMAGE_LAYOUT_FAILED',stage:'presentation-cover',missingSlides:[slide.slideNumber]});
                 options.onDiagnostic?.({slideNumber:slide.slideNumber,message:error.message,field:error.field});
@@ -182,7 +191,7 @@ export async function resolvePresentationVisuals(presentation, context = {}, opt
                         caption:catalog?.caption || diagram.caption || 'Simplified schematic',references:catalog?.references || [],catalogId:catalog?.id},root);
                     slide.visualResolution={status:'resolved',method:catalog ? 'local-catalog' : 'structured-diagram'};
                     if(catalog) warnings.push({code:'DIAGRAM_SIMPLIFIED',stage:'visual-resolution',slideNumber:slide.slideNumber,message:'An original labeled schematic is used as an accurate alternative; it does not depict fine anatomical geometry or tissue detail.'});
-                    validateRenderContent(slide);
+                    await validateLayout(slide);
                 } catch(error) { diagram=null; delete slide.resolvedVisual; options.onDiagnostic?.({slideNumber:slide.slideNumber,message:error.message,field:error.field}); }
             }
             if(!slide.resolvedVisual){
@@ -194,7 +203,7 @@ export async function resolvePresentationVisuals(presentation, context = {}, opt
                 // additional illustration fails. Never collapse a native visual to prose.
             }
             else if(!diagram){
-                try{validateRenderContent(slide);}catch{
+                try{await validateLayout(slide);}catch{
                     delete slide.resolvedVisual;slide.visualResolution={status:'unresolved',method:'text-layout-fallback'};
                     warnings.push({code:'VISUAL_LAYOUT_FALLBACK',stage:'visual-resolution',slideNumber:slide.slideNumber,message:'The resolved photograph could not fit alongside complete readable content; a text layout is used.'});
                 }
@@ -205,17 +214,25 @@ export async function resolvePresentationVisuals(presentation, context = {}, opt
     for(const slide of slides) {
         // Visuals can change geometry after AI-stage fit validation. Preserve
         // all approved text by removing optional artwork before final rendering.
-        try {validateRenderContent(slide);} catch(error) {
+        try {await validateLayout(slide);} catch(error) {
             if(slide.coverArtwork) {
                 delete slide.coverArtwork;
-                try{validateRenderContent(slide);}catch(failure){throw Object.assign(failure,{stage:'visual-layout-validation'});}
+                try{await validateLayout(slide);}catch(failure){throw Object.assign(failure,{stage:'visual-layout-validation'});}
                 warnings.push({code:'COVER_LAYOUT_FALLBACK',stage:'visual-resolution',slideNumber:slide.slideNumber,message:'Decorative cover artwork was omitted so the complete title and subtitle remain readable.'});
             } else {
                 throw Object.assign(error,{stage:'visual-layout-validation'});
             }
         }
     }
+    for(const slide of slides)if(slide.imageRequirement&&!slide.imageRequirement.required&&!slide.photoAsset){slide.visualResolution={status:'adapted',method:slide.resolvedVisual?.diagram||slide.content?.visualContent?.visual?.diagram||slide.content?.relationship||slide.content?.process?'native-diagram':'professional-content-layout',recovered:true};}
     const result={...presentation,imageRequestId:session.requestId,slides,visualTheme:{family:theme.family,style:theme.style},warnings:[...(presentation.warnings||[]),...warnings]};
+    const adapted=slides.filter(s=>s.visualResolution?.recovered).map(s=>s.slideNumber);
+    if(adapted.length){result.imageCoveragePlan={...result.imageCoveragePlan,plannedTarget:result.imageCoveragePlan.target,target:result.imageCoveragePlan.target-adapted.length,adaptedOptionalSlides:adapted};console.info('[GENERATION_RECOVERY]',JSON.stringify({requestId:performanceRequestId()||session.requestId,outputType:'presentation',stage:'visual-resolution',status:'recovered',code:'OPTIONAL_IMAGES_UNAVAILABLE',slides:adapted}));}
+    const missingDiagrams=slides.filter(s=>s.visualRequirement?.kind==='diagram'&&s.visualRequirement.required&&!s.resolvedVisual?.diagram&&!s.content?.visualContent?.visual?.diagram&&!s.content?.process&&!s.content?.relationship&&!s.content?.timeline&&!s.content?.roadmap&&!s.content?.chart&&!s.content?.table).map(s=>s.slideNumber);
+    result.visualValidation={status:missingDiagrams.length?'incomplete':'passed',requiredMissing:missingDiagrams};
+    console.info('[PRESENTATION_VISUAL]',JSON.stringify({requestId:performanceRequestId()||session.requestId,outputType:'presentation',stage:'visual-validation',...result.visualValidation}));
+    if(missingDiagrams.length)result.warnings.push({code:'VISUAL_REQUIREMENTS_UNMET',stage:'visual-validation',missingSlides:missingDiagrams,message:'Required diagrams could not be resolved accurately. Available artifacts retain explanatory content but the visual requirements remain incomplete.'});
+    for(const slide of slides)if(slide.layoutRecovery?.status==='repaired')result.warnings.push({code:'LAYOUT_TEXT_REPAIRED',stage:'visual-layout-repair',slideNumber:slide.slideNumber,fields:slide.layoutRecovery.fields,message:'Selected approved text was concisely rewritten to fit the final composition; other content and imagery were preserved.'});
     result.visualQuality=imageCoverage(result,session.diagnostics,session.budget.report());
     if(strict&&!result.visualQuality.requiredComplete)throw Object.assign(new Error('Required pictures did not fit alongside the approved slide content. No image-free presentation was published. Shorten the content or retry generation so it can be replanned.'),{code:'PRESENTATION_IMAGE_LAYOUT_FAILED',stage:'visual-layout-validation',missingSlides:result.visualQuality.missingAssets});
     result.imageValidation={status:result.visualQuality.requiredComplete?'passed':'incomplete',requiredMissing:result.visualQuality.missingAssets};

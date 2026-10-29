@@ -2,6 +2,7 @@ import {evaluateImageRelevance,imageTopicDomains} from '../visual/imageRelevance
 import {isPhotographicStock} from '../visual/imageMedia.mjs';
 import {requiresConceptImage,isConceptAsset} from './imageIntent.mjs';
 import {matchesImageIdentity,matchesImageDetail} from '../visual/imageIdentity.mjs';
+import {imageContextHash} from '../visual/assetBinding.mjs';
 const concepts={
     space:/\b(?:spacecraft|astronauts?|rockets?|lunar|martian|mars|orbital|planetary|deep[ -]space)\b/i,
     literary:/\b(?:reading|literary|books?|library|stories|storytelling|chapters)\b/i,
@@ -35,6 +36,7 @@ export function centralImageSubject(page){
     return {description:central,concepts:preferred};
 }
 export function reviewImageCandidate(record,target,{width,height}={}){
+    if(record.source==='Lorem Picsum'&&record.raceValidation?.validated&&record.raceValidation.contextHash===imageContextHash(target)&&!target.identityLabel&&!requiresConceptImage(target))return {accepted:!!(record.licenseVerified&&record.creator&&(!width||width>=800&&height>=600&&width/height>=.6&&width/height<=3.2)),method:'validated-pixel-review-and-dimensions',reason:'PIXEL_REVIEW_MATCH'};
     // Generation uses the full requested scene/purpose as intent evidence;
     // it is not independent visual verification of the returned pixels.
     if(record.sourceType==='ai-generated'||record.generationMethod==='ai-generated'||record.source==='Google Gemini')record={...record,subject:[target.query,target.subjectContext||target.topic].filter(Boolean).join('. ')};
@@ -50,6 +52,10 @@ export function reviewImageCandidate(record,target,{width,height}={}){
     const queryWords=[...new Set((target.query||'').toLowerCase().match(/[a-z]{5,}/g)||[])].filter(word=>!['illustrative','editorial','imagery','photography','photograph','website','concept','image'].includes(word));
     const candidateText=[record.subject,record.alt,...(record.keywords||[])].join(' ').toLowerCase();
     const shared=queryWords.filter(word=>new RegExp('\\b'+word+'\\b').test(candidateText)).length;
+    const subjectCoverage=shared/Math.max(1,queryWords.length);
+    const configuredThreshold=Number(process.env.WEBPAGE_IMAGE_SUBJECT_COVERAGE_MIN||.3);
+    const subjectThreshold=Number.isFinite(configuredThreshold)&&configuredThreshold>=.1&&configuredThreshold<=1?configuredThreshold:.3;
+    if(target.strictSubject&&subjectCoverage<subjectThreshold)return {accepted:false,reason:'SECTION_SUBJECT_EVIDENCE_MISSING',subjectCoverage,subjectThreshold,method:'independent-section-metadata',limits:'Lexical evidence coverage, not visual confidence.'};
     const relevance=evaluateImageRelevance(record,target);
     const semanticScore=!relevance.accepted?0:relevance.desiredDomains.length?1:desired.length?(compatible?1:0):shared>=2&&shared/Math.max(queryWords.length,1)>=.45?1:0;
     const minimum=target.role==='hero'?800:400;

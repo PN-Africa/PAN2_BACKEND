@@ -1,9 +1,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {fork} from 'node:child_process';
+import {trackedFork as fork} from '../renderProcesses.mjs';
 import {fileURLToPath} from 'node:url';
 import {validateStaticWebsite} from '../webpageStaticValidator.mjs';
+import {inspectDesignCompleteness} from './designQuality.mjs';
 let browserBusy=false;
 const repairCss='\n/* Bounded responsive containment repair */\n.hero-grid,.section-layout,.card-grid,.project-grid,.collection-grid{min-width:0}.hero-copy,.section-body,article{min-width:0;overflow-wrap:anywhere}.nav{overflow-wrap:anywhere}.brand{max-width:36%}@media(max-width:820px){.hero-grid,.section-layout{grid-template-columns:minmax(0,1fr)}.nav{max-width:100%}}\n';
 
@@ -22,12 +23,14 @@ async function browserAudit(files,options){
         worker.once('error',error=>{clearTimeout(timer);reject(error);});
         worker.once('exit',()=>{clearTimeout(timer);reject(new Error('Browser QA worker exited before a report'));});
         worker.send({directory,pages:Object.keys(files).filter(name=>name.endsWith('.html'))});
-    });
+    }).finally(async()=>{if(process.env.LEDIFY_RETAIN_QA_ARTIFACTS==='true')return;try{await fs.rm(directory,{recursive:true,force:true,maxRetries:3,retryDelay:50});}catch{console.warn('[QA_CLEANUP]',JSON.stringify({errorCode:'QA_TEMP_CLEANUP_FAILED'}));}});
 }
 
 export async function inspectWebsite(files,options={}){
     const staticResult=validateStaticWebsite(files),warnings=[];
-    let report={static:'passed',browser:'not-run',repairAttempts:0,subjectiveReview:'required'};
+    const designCompleteness=inspectDesignCompleteness(files);
+    if(designCompleteness.issues.length)warnings.push({code:'WEBPAGE_DESIGN_REVIEW_REQUIRED',message:'Objective visual completeness checks require review.',issues:designCompleteness.issues});
+    let report={static:'passed',designCompleteness,browser:'not-run',repairAttempts:0,subjectiveReview:'required'};
     if(!options.runner && process.env.WEBPAGE_BROWSER_QA!=='true')return {files,report,warnings};
     if(browserBusy)return {files,report:{...report,browser:'skipped-capacity'},warnings:[{code:'WEBPAGE_BROWSER_QA_BUSY',message:'Browser QA capacity is occupied; static validation passed.'}]};
     browserBusy=true;

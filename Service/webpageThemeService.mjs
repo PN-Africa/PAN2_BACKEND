@@ -53,11 +53,13 @@ export function webpageThemeService(page, context = {}) {
     const callerPalette=context.designPreferences?.paletteId;
     const paletteId=callerPalette&&callerPalette!=='auto'?callerPalette:profile.palette||requestedPalette&&requestedPalette!=='auto'&&requestedPalette||inferred||defaults[industry];
     const colors = { ...(curated[paletteId] || palettes[preset]) };
+    if(page.artifactDesign&&process.env.LEDIFY_DESIGN_ENGINE!=='legacy')Object.assign(colors,page.artifactDesign.theme.colors);
     for (const key of ['primary', 'secondary', 'accent','background','surface','text','muted']) {
-        const value = context.designPreferences?.colors?.[key] || (!profile.palette&&!curated[paletteId]?(page.design?.[key] || page.design?.colors?.[key]):null);
+        const value = context.designPreferences?.colors?.[key] || (!page.artifactDesign&&!profile.palette&&!curated[paletteId]?(page.design?.[key] || page.design?.colors?.[key]):null);
         if (value && !/^#[\da-f]{6}$/i.test(value)) throw new Error('Invalid design color: ' + key);
         if (value) colors[key] = value;
     }
+    if(page.artifactDesign&&process.env.LEDIFY_DESIGN_ENGINE!=='legacy'&&!context.designPreferences?.colors?.secondary)colors.secondary=blend(colors.primary,colors.accent,.25);
     colors.secondary ||= blend(colors.primary,colors.accent,.25);
     colors.onPrimary = foreground(colors.primary); colors.onAccent = foreground(colors.accent);colors.onSecondary=foreground(colors.secondary);
     for(const key of ['text','muted'])if(['background','surface'].some(bg=>contrast(colors[key],colors[bg])<4.5))colors[key]=foreground(colors.background);
@@ -66,7 +68,7 @@ export function webpageThemeService(page, context = {}) {
     if(contrast(colors.muted,colors.surface)<4.5)colors.muted=colors.text;
     colors.border=blend(colors.background,colors.text,.22);colors.primaryHover=blend(colors.primary,colors.text,.12);colors.onPrimaryHover=foreground(colors.primaryHover);colors.focus=colors.text;
     const pairs={humanist:{heading:"'Segoe UI',Arial,sans-serif",body:"'Segoe UI',Arial,sans-serif"},editorial:{heading:"Georgia,'Times New Roman',serif",body:"'Segoe UI',Arial,sans-serif"},technical:{heading:"Arial,Helvetica,sans-serif",body:"Arial,Helvetica,sans-serif"},classical:{heading:"'Palatino Linotype',Palatino,Georgia,serif",body:"Arial,Helvetica,sans-serif"},geometric:{heading:"'Century Gothic',Futura,'Trebuchet MS',sans-serif",body:"'Segoe UI',Arial,sans-serif"},display:{heading:"'Trebuchet MS','Arial Black',sans-serif",body:"'Segoe UI',Arial,sans-serif"},mono:{heading:"Consolas,'Courier New',monospace",body:"'Segoe UI',Arial,sans-serif"}};
-    const fontPair=context.websiteBrief?.preferredTypography || context.designPreferences?.fontPair || profile.font || page.designSpec?.fontPair || 'humanist';
+    const fontPair=context.websiteBrief?.preferredTypography || context.designPreferences?.fontPair || page.artifactDesign?.theme.fontPair || profile.font || page.designSpec?.fontPair || 'humanist';
     if(!pairs[fontPair])throw new Error('Unsupported website font pair');
     const tokens=completeVisualTokens(colors);
     const sectionTokens=Object.fromEntries(page.sections.map(section=>[section.id,sectionVisualTokens(tokens,section.background||'plain')]));

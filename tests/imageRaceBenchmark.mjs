@@ -1,0 +1,11 @@
+import fs from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import {raceImages} from '../Service/visual/imageRace.mjs';
+const ids=['commons','unsplash','picsum','gemini','pixabay'],sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),reports=[];
+for(const expected of [...ids,'unsplash-after-rejection','none'])for(let repetition=1;repetition<=3;repetition++){
+ const logs=[],start=performance.now(),winner=expected==='unsplash-after-rejection'?'unsplash':expected;
+ const result=await raceImages(ids.map((id,index)=>({id,kind:id==='gemini'?'generation':'stock',acquire:async()=>{await sleep(expected==='unsplash-after-rejection'&&id==='picsum'?1:id===winner?10:35+index*5);return {id,valid:expected!=='none'&&!(expected==='unsplash-after-rejection'&&id==='picsum')};}})),{requestId:'benchmark-'+expected+'-'+repetition,generationType:repetition%2?'presentation':'webpage'},{logger:e=>logs.push(e),validate:async asset=>{await sleep(1);return asset.valid;},timeoutMs:200});
+ const selectionMs=performance.now()-start;assert.equal(result?.raceWinner||'none',winner);assert.equal(logs.filter(l=>l.status==='started').length,5);
+ await sleep(65);const metric=logs.find(l=>l.status==='winner');reports.push({scenario:expected,repetition,winner:result?.raceWinner||null,selectionMs:Number(selectionMs.toFixed(2)),timeToFirstImageMs:metric?.timeToFirstImageMs,timeToFirstValidImageMs:metric?.timeToFirstValidImageMs,providers:ids.map(id=>({provider:id,...Object.fromEntries(['responseMs','validationMs','startOffsetMs'].map(key=>[key,[...logs].reverse().find(l=>l.provider===id&&Number.isFinite(l[key]))?.[key]])),status:logs.find(l=>l.provider===id&&l.status==='winner')?'winner':logs.find(l=>l.provider===id&&l.status==='cancelled')?'cancelled':'rejected'}))});
+}
+await fs.mkdir('generated/image-race-benchmark',{recursive:true});await fs.writeFile('generated/image-race-benchmark/report.json',JSON.stringify({mocked:true,billableCalls:0,runs:reports},null,2));for(const scenario of [...new Set(reports.map(r=>r.scenario))]){const runs=reports.filter(r=>r.scenario===scenario);console.log(JSON.stringify({scenario,winners:runs.map(r=>r.winner),meanSelectionMs:Number((runs.reduce((n,r)=>n+r.selectionMs,0)/runs.length).toFixed(2))}));}

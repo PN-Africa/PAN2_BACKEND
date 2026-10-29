@@ -65,9 +65,9 @@ test('supplied authorized imagery takes priority and provider outages fall back 
     const root=await temporary(t),image=await fs.readFile('assets/webpage/curated/laboratory.jpg'),p=base();
     let called=0;const provider={id:'test-provider',acquire:async()=>{called++;throw new Error('SECRET-KEY-should-never-be-exposed');}};
     const context={websiteBrief:{imageAssets:[{url:'https://brand.example/photo.jpg',rightsConfirmed:true,creator:'Brand',license:'Authorized brand image',alt:'Brand laboratory',role:'hero',authentic:true}]}};
-    const supplied=await acquireWebsiteImages(p,context,{download:async()=>image,providers:[provider],optimization:{cacheRoot:root}});
+    const supplied=await acquireWebsiteImages(p,context,{download:async()=>image,providers:[provider],policy:{maxAssets:1},optimization:{cacheRoot:root}});
     assert.equal(called,0);assert.equal(supplied.page.visualAssets.hero.source,'User supplied');assert.equal(supplied.page.visualAssets.hero.caption,'');
-    const fallback=await acquireWebsiteImages(p,{}, {providers:[provider],optimization:{cacheRoot:root}});assert.equal(called,1);assert.ok(fallback.page.visualAssets.hero);assert.ok(!JSON.stringify(fallback.warnings).includes('SECRET'));
+    const fallback=await acquireWebsiteImages(p,{}, {providers:[provider],policy:{maxAssets:1},optimization:{cacheRoot:root}});assert.equal(called,1);assert.ok(fallback.page.visualAssets.hero);assert.ok(!JSON.stringify(fallback.warnings).includes('SECRET'));
     const none=await acquireWebsiteImages(p,{}, {providers:[],curated:false});assert.equal(none.page.visualAssets.hero,undefined);assert.ok(none.warnings.some(w=>w.code==='WEBPAGE_IMAGERY_UNAVAILABLE'));
 });
 
